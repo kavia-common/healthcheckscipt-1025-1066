@@ -47,7 +47,9 @@ def _parse_args() -> argparse.Namespace:
         description="Run DU health checks against a Kubernetes environment."
     )
     parser.add_argument("--site-id", dest="site_id", type=str, default=None, help="Optional site identifier to include in the report")
+    # Back-compat: keep --environment and add --env (alias)
     parser.add_argument("--environment", dest="environment", type=str, default=None, help="Environment override: dev|stage|prod")
+    parser.add_argument("--env", dest="env", type=str, default=None, help="Environment alias: dev|stage|prod (same as --environment)")
     parser.add_argument("--namespace", dest="namespace", type=str, default=None, help="K8s namespace")
     parser.add_argument("--node-label-selector", dest="node_label_selector", type=str, default=None, help="K8s node label selector")
     parser.add_argument("--pod-label-selector", dest="pod_label_selector", type=str, default=None, help="K8s pod label selector")
@@ -70,6 +72,10 @@ def run_cli(site_id: Optional[str] = None, environment: Optional[str] = None, ov
         Dict[str, Any]: Structured health report to be printed or returned to schedulers.
     """
     cfg = AppConfig()
+    # Load from YAML + env using target environment
+    cfg.load_from_files_and_env(env_override=environment)
+
+    # Apply direct overrides and explicit args after load (highest precedence)
     if environment:
         cfg.environment = environment
     if site_id is not None:
@@ -131,6 +137,8 @@ def run_cli(site_id: Optional[str] = None, environment: Optional[str] = None, ov
 
 def main() -> int:
     args = _parse_args()
+    # select environment from --env or --environment (priority to --env)
+    env_arg = args.env if getattr(args, "env", None) else args.environment
 
     # Compose overrides from CLI args
     overrides: Dict[str, Any] = {}
@@ -143,30 +151,19 @@ def main() -> int:
     if args.log_level:
         overrides["log_level"] = args.log_level
 
-    # Use a temporary logger at INFO for early messages; final logger set inside run_cli via config.
-    # We avoid double initialization; setup_logging within run_cli will reconfigure appropriately.
-
     try:
-        result = run_cli(site_id=args.site_id, environment=args.environment, overrides=overrides)
+        result = run_cli(site_id=args.site_id, environment=env_arg, overrides=overrides)
     except Exception as exc:
-        # As logging may not be initialized if config failed, print a clear message as well
         print(f"[FATAL] DU health check failed: {exc}", file=sys.stderr)
         return 2
 
-    # After success, conditionally export to Kafka/Loki using current config
+    # After success, conditionally export to Kafka/Loki using the same loaded config precedence
     cfg = AppConfig()
-    if args.environment:
-        cfg.environment = args.environment
+    cfg.load_from_files_and_env(env_override=env_arg)
     if args.site_id is not None:
         cfg.site_id = args.site_id
-    if args.namespace:
-        cfg.namespace = args.namespace
-    if args.node_label_selector:
-        cfg.node_label_selector = args.node_label_selector
-    if args.pod_label_selector:
-        cfg.pod_label_selector = args.pod_label_selector
-    if args.log_level:
-        cfg.log_level = args.log_level
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
 
     logger = setup_logging(cfg.log_level)
 
@@ -177,7 +174,6 @@ def main() -> int:
             logger.info("Published health report to Kafka")
         except Exception as exc:
             logger.exception("Kafka publish failed")
-            # Push an error to Loki if available and not disabled
             if not args.no_loki:
                 try:
                     push_to_loki(cfg.loki_url, cfg.loki_tenant_id, cfg.loki_labels,
@@ -197,10 +193,8 @@ def main() -> int:
             push_to_loki(cfg.loki_url, cfg.loki_tenant_id, cfg.loki_labels, loki_entries, logger)
             logger.info("Pushed logs to Loki")
         except Exception:
-            # errors already logged inside push_to_loki
             pass
 
-    # Always print the resulting JSON on stdout for Airflow logs and easy parsing
     print(json.dumps(result, indent=2))
     return 0 if result.get("status") == "healthy" else 1
 

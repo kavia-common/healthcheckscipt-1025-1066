@@ -1,0 +1,27 @@
+# Example configuration for development environment
+environment: dev
+log_level: DEBUG
+namespace: default
+node_label_selector: "ran.site=true"
+pod_label_selector: "du=true"
+kafka_health_topic: "du.health.reports.dev"
+
+# External services - typically use environment variables for secrets/tokens
+vault_addr: "http://localhost:8200"
+# vault_token: ""  # prefer to set via VAULT_TOKEN env
+vault_kubeconfig_path: "kv/data/kubeconfigs/dev"
+
+kafka_bootstrap_servers: "localhost:9092"
+loki_url: "http://localhost:3100"
+# loki_tenant_id: ""  # can be set via LOKI_TENANT_ID env
+loki_labels: '{app="du-healthcheck",env="dev"}'
+
+# Connectivity
+# cu_host: ""
+cu_port: 38472
+# ru_host: ""
+ru_port: 22102
+connectivity_timeout: 3.0
+
+request_timeout: 8.0
+airflow_enabled: false

@@ -13,15 +13,37 @@ This application is a standalone Python script for executing health checks on DU
 - Is schedulable (Airflow-compatible callable). No Flask / web API.
 
 ## Configuration
-Copy `.env.example` to your environment and set values via your deployment mechanism.
 
-Key variables:
+The app now supports environment-specific YAML config files with environment variable fallback.
+
+- Config directory (default): HealthCheckScriptContainer/configs
+- File naming: config_<env>.yaml (e.g., config_dev.yaml, config_stage.yaml, config_prod.yaml)
+- Selection priority:
+  1) CLI overrides and explicit flags
+  2) Environment variables (e.g., VAULT_TOKEN)
+  3) YAML file values for the selected environment
+  4) Built-in defaults
+
+Selecting environment:
+- Use `--env dev|stage|prod` on CLI (or `--environment` for backward-compat)
+- Or set ENVIRONMENT=dev|stage|prod
+- Optional override config dir via CONFIG_DIR env var
+
+Example:
+```
+python main.py --site-id site-001 --env stage
+```
+
+Sensitive values like tokens can be omitted from YAML and provided via environment variables.
+
+Key environment variables (fallbacks/overrides):
 - ENVIRONMENT, LOG_LEVEL, SITE_ID
 - VAULT_ADDR, VAULT_TOKEN, VAULT_KUBECONFIG_PATH
 - KAFKA_BOOTSTRAP_SERVERS, KAFKA_HEALTH_TOPIC
 - LOKI_URL, LOKI_TENANT_ID, LOKI_LABELS
 - NODE_LABEL_SELECTOR, POD_LABEL_SELECTOR, K8S_NAMESPACE
 - CU_HOST, CU_PORT, RU_HOST, RU_PORT, CONNECTIVITY_TIMEOUT
+- CONFIG_DIR (optional, path to configs)
 
 ## Usage - Standalone CLI
 Run the health check directly:

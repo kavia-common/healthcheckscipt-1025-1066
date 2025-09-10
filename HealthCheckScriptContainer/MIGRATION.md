@@ -18,3 +18,10 @@ What to update:
 
 Environment:
 - See `.env.example` for required variables (Vault, Kafka, Loki, selectors).
+
+Configuration files:
+- You can now supply environment-specific YAML configs under `HealthCheckScriptContainer/configs/`:
+  - `config_dev.yaml`, `config_stage.yaml`, `config_prod.yaml`
+- Select with `--env` (preferred) or `--environment`, or via `ENVIRONMENT` env var.
+- Secrets such as `VAULT_TOKEN` should be provided via environment variables; values in env override YAML.
+- Optionally set `CONFIG_DIR` to point to a different config directory at runtime.

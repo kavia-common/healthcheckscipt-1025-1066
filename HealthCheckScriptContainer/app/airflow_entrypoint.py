@@ -20,12 +20,14 @@ def run_healthcheck(site_id: Optional[str] = None, environment: Optional[str] = 
     from . import config as _config
     from ..main import run_cli  # type: ignore
 
-    overrides = {}
+    overrides: Dict[str, Any] = {}
     cfg = _config.AppConfig()
+    # Load to pick up YAML + env for defaults (namespace/selectors) using provided environment
+    cfg.load_from_files_and_env(env_override=environment)
+
     if environment:
         overrides["environment"] = environment
     if cfg:
-        # respect env-configured defaults like namespace/selectors
         overrides["namespace"] = cfg.namespace
         overrides["node_label_selector"] = cfg.node_label_selector
         overrides["pod_label_selector"] = cfg.pod_label_selector

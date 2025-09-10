@@ -1,0 +1,26 @@
+# Example configuration for production environment
+environment: prod
+log_level: INFO
+namespace: du-prod
+node_label_selector: "ran.site=true"
+pod_label_selector: "du=true"
+kafka_health_topic: "du.health.reports"
+
+vault_addr: "https://vault.prod.example.com"
+# vault_token: ""  # set via env/secret manager
+vault_kubeconfig_path: "kv/data/kubeconfigs/prod"
+
+kafka_bootstrap_servers: "kafka-1.prod.example.com:9092,kafka-2.prod.example.com:9092,kafka-3.prod.example.com:9092"
+loki_url: "https://loki.prod.example.com"
+# loki_tenant_id: ""  # set via env
+loki_labels: '{app="du-healthcheck",env="prod"}'
+
+# Connectivity
+# cu_host: "cu.prod.example.com"
+cu_port: 38472
+# ru_host: "ru.prod.example.com"
+ru_port: 22102
+connectivity_timeout: 3.0
+
+request_timeout: 8.0
+airflow_enabled: true
