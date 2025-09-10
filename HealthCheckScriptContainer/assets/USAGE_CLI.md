@@ -29,6 +29,16 @@ Disable Kafka/Loki (dry-run for network publishing):
 python main.py --no-kafka --no-loki
 ```
 
+Simulation mode (mock all external systems):
+```
+# Via CLI flag
+python main.py --env dev --simulate
+
+# Or via environment variable
+SIMULATION_MODE=true python main.py --env dev
+```
+In simulation mode, Kubernetes/Vault/Kafka/Loki are replaced with simulators; logs will indicate simulation is active.
+
 Configuration files:
 - The app loads `configs/config_<env>.yaml` automatically based on `--env`/`--environment` or `ENVIRONMENT`.
 - Any missing values in the file can be supplied via environment variables (e.g., VAULT_TOKEN).

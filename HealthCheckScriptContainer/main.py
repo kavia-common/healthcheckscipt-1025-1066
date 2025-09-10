@@ -36,6 +36,7 @@ from app.connectivity_utils import tcp_connectivity_check
 from app.report_utils import build_health_report
 from app.publishers import send_to_kafka, push_to_loki
 from app.logging_utils import LogContext, log_with, new_trace_id
+# Simulation adapters are imported lazily where used to avoid import-time side effects and linter warnings.
 
 
 def _apply_overrides(cfg: AppConfig, site_id: Optional[str], environment: Optional[str], overrides: Optional[Dict[str, Any]]) -> None:
@@ -88,6 +89,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", dest="log_level", type=str, default=None, help="Logging level (DEBUG, INFO, WARN, ERROR)")
     parser.add_argument("--no-kafka", dest="no_kafka", action="store_true", help="Do not publish results to Kafka")
     parser.add_argument("--no-loki", dest="no_loki", action="store_true", help="Do not push logs to Loki")
+    parser.add_argument("--simulate", dest="simulate", action="store_true", help="Enable simulation mode (no external systems)")
     return parser.parse_args()
 
 
@@ -113,6 +115,18 @@ def _log_effective_config(logger: logging.Logger, cfg: AppConfig) -> None:
 
 
 def _prepare_k8s(logger: logging.Logger, cfg: AppConfig):
+    """Prepare a CoreV1Api compatible client, using simulator if enabled."""
+    if getattr(cfg, "simulation_mode", False):
+        log_with(logger, logging.INFO, event="simulation_active", component="k8s|vault")
+        from app.simulators import simulated_fetch_kubeconfig_from_vault, simulated_build_k8s_client_from_kubeconfig  # local import
+
+        kubeconfig = simulated_fetch_kubeconfig_from_vault(
+            cfg.vault_addr or "http://sim.vault", cfg.vault_token or "SIM", cfg.vault_kubeconfig_path or "kv/sim", timeout=cfg.request_timeout
+        )
+        core_api, _ = simulated_build_k8s_client_from_kubeconfig(kubeconfig)
+        log_with(logger, logging.INFO, event="sim_k8s_client_ready")
+        return core_api
+    # Real path
     kubeconfig = fetch_kubeconfig_from_vault(
         cfg.vault_addr, cfg.vault_token, cfg.vault_kubeconfig_path, timeout=cfg.request_timeout
     )
@@ -123,15 +137,35 @@ def _prepare_k8s(logger: logging.Logger, cfg: AppConfig):
 
 
 def _discover_cluster(logger: logging.Logger, core_api, cfg: AppConfig):
-    nodes = list_nodes(core_api, cfg.node_label_selector)
+    """Discover nodes and pods using either real client or simulator."""
+    if getattr(cfg, "simulation_mode", False):
+        from app.simulators import simulated_list_nodes, simulated_list_pods  # local import
+
+        nodes = simulated_list_nodes(core_api, cfg.node_label_selector)
+        pods = simulated_list_pods(core_api, cfg.namespace, cfg.pod_label_selector)
+    else:
+        nodes = list_nodes(core_api, cfg.node_label_selector)
+        pods = list_pods(core_api, cfg.namespace, cfg.pod_label_selector)
     log_with(logger, logging.INFO, event="nodes_discovered", count=len(nodes))
-    pods = list_pods(core_api, cfg.namespace, cfg.pod_label_selector)
     log_with(logger, logging.INFO, event="pods_discovered", count=len(pods))
     return nodes, pods
 
 
 def _gather_metrics_and_connectivity(logger: logging.Logger, core_api, cfg: AppConfig, pods):
-    metrics = collect_logs_and_metrics(core_api, cfg.namespace, pods)
+    # In simulation, inject simulated exec to the metrics path
+    if getattr(cfg, "simulation_mode", False):
+        import app.kube_utils as kube_utils_mod  # type: ignore
+        from app.simulators import simulated_safe_exec_command  # local import
+
+        original_exec = getattr(kube_utils_mod, "_safe_exec_command", None)
+        try:
+            setattr(kube_utils_mod, "_safe_exec_command", simulated_safe_exec_command)
+            metrics = collect_logs_and_metrics(core_api, cfg.namespace, pods)
+        finally:
+            if original_exec is not None:
+                setattr(kube_utils_mod, "_safe_exec_command", original_exec)
+    else:
+        metrics = collect_logs_and_metrics(core_api, cfg.namespace, pods)
     log_with(logger, logging.INFO, event="metrics_collected")
     connectivity = _build_connectivity(cfg)
     log_with(logger, logging.INFO, event="connectivity_complete", cu=connectivity.get("cu"), ru=connectivity.get("ru"))
@@ -166,6 +200,8 @@ def main() -> int:
     env_arg = args.env if getattr(args, "env", None) else args.environment
 
     overrides = _build_overrides_from_args(args)
+    if getattr(args, "simulate", False):
+        overrides["simulation_mode"] = True
 
     try:
         result = run_cli(site_id=args.site_id, environment=env_arg, overrides=overrides)
@@ -185,14 +221,31 @@ def main() -> int:
     logger = setup_logging(cfg.log_level)
 
     if not args.no_kafka:
-        _publish_to_kafka_safe(cfg, result, logger, also_push_loki=not args.no_loki)
+        if getattr(cfg, "simulation_mode", False):
+            try:
+                from app.simulators import simulated_send_to_kafka  # local import
+
+                log_with(logger, logging.INFO, event="sim_publish_kafka_start", topic=cfg.kafka_health_topic)
+                simulated_send_to_kafka(cfg.kafka_bootstrap_servers or "localhost:9092", cfg.kafka_health_topic, result, logger)
+                log_with(logger, logging.INFO, event="sim_publish_kafka_end")
+            except Exception as exc:
+                log_with(logger, logging.ERROR, event="sim_publish_kafka_error", error=str(exc))
+        else:
+            _publish_to_kafka_safe(cfg, result, logger, also_push_loki=not args.no_loki)
 
     if not args.no_loki:
         loki_entries = _build_loki_entries(result, cfg.site_id)
         try:
-            log_with(logger, logging.INFO, event="push_loki_start", entries=len(loki_entries))
-            push_to_loki(cfg.loki_url, cfg.loki_tenant_id, cfg.loki_labels, loki_entries, logger)
-            log_with(logger, logging.INFO, event="push_loki_end")
+            if getattr(cfg, "simulation_mode", False):
+                from app.simulators import simulated_push_to_loki  # local import
+
+                log_with(logger, logging.INFO, event="sim_push_loki_start", entries=len(loki_entries))
+                simulated_push_to_loki(cfg.loki_url or "http://localhost:3100", cfg.loki_tenant_id, cfg.loki_labels, loki_entries, logger)
+                log_with(logger, logging.INFO, event="sim_push_loki_end")
+            else:
+                log_with(logger, logging.INFO, event="push_loki_start", entries=len(loki_entries))
+                push_to_loki(cfg.loki_url, cfg.loki_tenant_id, cfg.loki_labels, loki_entries, logger)
+                log_with(logger, logging.INFO, event="push_loki_end")
         except Exception:
             pass
 

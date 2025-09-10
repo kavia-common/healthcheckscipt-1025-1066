@@ -170,10 +170,39 @@ Secrets and configuration:
 - Provide secrets (e.g., VAULT_TOKEN) via Airflow Variables/Connections or environment variables in the DAG/task.
 - The app can load environment-specific configs from configs/config_<env>.yaml and merge with env vars at runtime.
 
+## Simulation Mode (Development/Tests)
+You can run the health check end-to-end without any real external systems (Kubernetes, Vault, Kafka, Loki) by enabling simulation mode. In simulation mode:
+- Vault kubeconfig retrieval returns a fabricated kubeconfig (never used to reach a real cluster).
+- Kubernetes client, nodes, pods, logs, and exec calls are simulated with realistic values.
+- Kafka publish and Loki push are no-ops that log simulated actions.
+- Structured logs will include events like "simulation_mode_enabled", "sim_kafka_produce", "sim_loki_push", etc.
+
+Enable simulation mode:
+- CLI: add `--simulate`
+- Or set environment variable: `SIMULATION_MODE=true`
+
+Example:
+```
+python main.py --site-id site-001 --env dev --simulate --no-kafka --no-loki
+# You can omit --no-kafka/--no-loki; in simulation they will be simulated and not reach out.
+```
+
+Configuration:
+- A sample simulated config is available: `configs/config_sim.yaml` (sets `simulation_mode: true`).
+- You may also set `SIMULATION_MODE=true` via environment variables.
+- In simulation, strict validation for Vault/Kafka/Loki is bypassed.
+
+Expected outputs in simulation:
+- Nodes: one ready, one not-ready.
+- Pods: a small set of DU pods with running containers.
+- Logs: fabricated radio metrics (srs errors, UL CRC fails, DL MCS, RRC established).
+- Exec-based metrics: CPU, RAM, disk, and SCTP values are simulated and parsable.
+- Kafka/Loki: logged as simulated push/produce with no network activity.
+
 ## Notes
 - The previous Flask app and HTTP endpoints have been removed.
 - OpenAPI docs and /docs are not applicable anymore.
-- External systems (Vault, Kubernetes, Kafka, Loki) must be reachable.
+- External systems (Vault, Kubernetes, Kafka, Loki) must be reachable unless simulation mode is enabled.
 
 ## Code-size diagnostics (developer aid)
 To measure function sizes and file lengths for refactoring, run:

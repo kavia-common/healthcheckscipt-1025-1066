@@ -134,6 +134,8 @@ class AppConfig:
 
     # Misc
     request_timeout: float = field(default_factory=lambda: float(os.getenv("REQUEST_TIMEOUT", "8.0")))
+    # Simulation toggle
+    simulation_mode: bool = field(default_factory=lambda: os.getenv("SIMULATION_MODE", "false").lower() == "true")
 
     # Internal: configuration directory
     config_dir: str = field(default_factory=lambda: os.getenv("CONFIG_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs")))

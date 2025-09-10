@@ -18,6 +18,10 @@ What to update:
 
 Environment:
 - See `.env.example` for required variables (Vault, Kafka, Loki, selectors).
+- For development without external dependencies, enable simulation mode:
+  - CLI: `--simulate`
+  - Env: `SIMULATION_MODE=true`
+  - In simulation, the app uses mock adapters for Kubernetes, Vault, Kafka, and Loki.
 
 Configuration files:
 - You can now supply environment-specific YAML configs under `HealthCheckScriptContainer/configs/`:
