@@ -1,7 +1,7 @@
 # DU Health Check Service (HealthCheckScriptContainer)
 
-This service is a Flask-based backend for executing health checks on DU sites in a 5G Kubernetes environment (ORAN 7.2). It:
-- Accepts site ID and environment via externalized config (env vars).
+This application is a standalone Python script for executing health checks on DU sites in a 5G Kubernetes environment (ORAN 7.2). It:
+- Accepts site ID and environment via CLI arguments or environment variables.
 - Retrieves kubeconfig securely from Vault.
 - Filters K8s nodes/pods by labels.
 - Performs node, pod, and container health checks.
@@ -10,10 +10,10 @@ This service is a Flask-based backend for executing health checks on DU sites in
 - Generates detailed health reports.
 - Publishes reports to Kafka and pushes failures/anomalies/logs to Loki.
 - Supports configurable log levels and multi-env (dev|stage|prod).
-- Is schedulable (Airflow-compatible callable) and exposes system integration endpoints (no UI).
+- Is schedulable (Airflow-compatible callable). No Flask / web API.
 
 ## Configuration
-Copy `.env.example` to your environment and set values via deployment mechanism.
+Copy `.env.example` to your environment and set values via your deployment mechanism.
 
 Key variables:
 - ENVIRONMENT, LOG_LEVEL, SITE_ID
@@ -23,22 +23,31 @@ Key variables:
 - NODE_LABEL_SELECTOR, POD_LABEL_SELECTOR, K8S_NAMESPACE
 - CU_HOST, CU_PORT, RU_HOST, RU_PORT, CONNECTIVITY_TIMEOUT
 
-## API (System Integration)
-- GET `/` -> Liveness
-- POST `/system/healthcheck`
-  Body (JSON):
-  {
-    "site_id": "site-001",
-    "environment": "dev",
-    "node_label_selector": "ran.site=true,site_id=site-001",
-    "pod_label_selector": "du=true",
-    "namespace": "du-namespace",
-    "airflow_run_id": "manual__2025-01-01T00:00:00"
-  }
+## Usage - Standalone CLI
+Run the health check directly:
+```
+python main.py --site-id site-001 --environment dev \
+  --namespace du-namespace \
+  --node-label-selector "ran.site=true,site_id=site-001" \
+  --pod-label-selector "du=true" \
+  --log-level INFO
+```
+Flags:
+- --site-id: Optional site identifier
+- --environment: dev|stage|prod
+- --namespace: Kubernetes namespace
+- --node-label-selector: Node label selector
+- --pod-label-selector: Pod label selector
+- --log-level: DEBUG|INFO|WARN|ERROR
+- --no-kafka: Disable Kafka publish
+- --no-loki: Disable Loki push
 
-Response: Full health report JSON. Also publishes to Kafka and logs to Loki.
+Exit codes:
+- 0: healthy
+- 1: degraded
+- 2: fatal error during execution
 
-Docs: OpenAPI at `/docs`
+The script prints a full JSON report to stdout for easy parsing and Airflow log visibility.
 
 ## Airflow
 You can import and call:
@@ -46,15 +55,12 @@ You can import and call:
 from app.airflow_entrypoint import run_healthcheck
 result = run_healthcheck(site_id="site-001", environment="stage")
 ```
-
-## Local run
+Or execute via BashOperator:
 ```
-python -m app.airflow_entrypoint
-```
-
-Or start Flask for system integration endpoints:
-```
-python run.py
+python {{ var.value.du_healthcheck_path }}/main.py --site-id site-001 --environment stage
 ```
 
-Note: External systems (Vault, Kubernetes, Kafka, Loki) must be reachable.
+## Notes
+- The previous Flask app and HTTP endpoints have been removed.
+- OpenAPI docs and /docs are not applicable anymore.
+- External systems (Vault, Kubernetes, Kafka, Loki) must be reachable.
