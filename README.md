@@ -72,15 +72,37 @@ Exit codes:
 The script prints a full JSON report to stdout for easy parsing and Airflow log visibility.
 
 ## Airflow
-You can import and call:
+There are two supported ways to schedule/trigger the health check via Airflow:
+
+1) PythonOperator (recommended)
+- Import the Airflow-compatible callable:
 ```
 from app.airflow_entrypoint import run_healthcheck
 result = run_healthcheck(site_id="site-001", environment="stage")
 ```
-Or execute via BashOperator:
+
+2) BashOperator (CLI)
+- Execute the CLI directly:
 ```
-python {{ var.value.du_healthcheck_path }}/main.py --site-id site-001 --environment stage
+python {{ var.value.du_healthcheck_path }}/main.py --site-id site-001 --env stage
+# --environment is also accepted (backward-compat)
 ```
+
+DAG example:
+- An example DAG file is provided at:
+  HealthCheckScriptContainer/assets/airflow_healthcheck_dag.py
+- Copy this file to your Airflow DAGs directory (e.g., $AIRFLOW_HOME/dags/).
+- It demonstrates both PythonOperator and BashOperator usage.
+- Adjust:
+  - schedule_interval (e.g., "*/30 * * * *" for every 30 minutes)
+  - site id (DU_HEALTHCHECK_SITE_ID env or inline variables)
+  - environment (DU_HEALTHCHECK_ENV env or inline variables)
+  - operator selection (PythonOperator, BashOperator, or both)
+  - paths (DU_HEALTHCHECK_PATH pointing to a folder containing main.py)
+
+Secrets and configuration:
+- Provide secrets (e.g., VAULT_TOKEN) via Airflow Variables/Connections or environment variables in the DAG/task.
+- The app can load environment-specific configs from configs/config_<env>.yaml and merge with env vars at runtime.
 
 ## Notes
 - The previous Flask app and HTTP endpoints have been removed.
