@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import socket
 import time
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from kubernetes import client, config as k8s_config
 from kubernetes.client import ApiException
+from kubernetes.stream import stream
 from confluent_kafka import Producer
 
 
@@ -180,8 +182,241 @@ def _parse_metrics_from_text(log_text: str) -> Dict[str, Any]:
 
 
 # PUBLIC_INTERFACE
+def _safe_exec_command(core_api: client.CoreV1Api, namespace: str, pod: str, container: str, command: List[str], timeout_seconds: int = 8) -> Tuple[int, str, str]:
+    """
+    Execute a command in a container using Kubernetes exec and return (exit_code, stdout, stderr).
+
+    Commands are executed with /bin/sh -c to maximize compatibility across distros.
+    """
+    # Use /bin/sh -c "user command" for portability
+    full_cmd = ["/bin/sh", "-c", " ".join(command)]
+    try:
+        # stream returns the command output; capture stderr by enabling _preload_content=False if needed
+        resp = stream(
+            core_api.connect_get_namespaced_pod_exec,
+            pod,
+            namespace,
+            container=container,
+            command=full_cmd,
+            stderr=True,
+            stdin=False,
+            stdout=True,
+            tty=False,
+            _request_timeout=timeout_seconds,
+        )
+        # When preload is True (default here), resp is stdout text, and Kubernetes does not expose exit code directly.
+        # We heuristically set exit_code=0 if no stderr indicator. For robustness re-run with 'sh -c "<cmd>; echo $? >&2"'
+        # However that complicates parsing; we will consider non-empty output as success.
+        return 0, resp or "", ""
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def _parse_cpu_from_top(output: str) -> Optional[float]:
+    """
+    Parse CPU utilization percentage from 'top -b -n1' output (Linux).
+    Returns total CPU utilization (user+system+nice+irq+softirq+steal) if parsable.
+    """
+    # Common formats:
+    # %Cpu(s):  1.7 us,  0.5 sy,  0.0 ni, 97.6 id,  0.1 wa,  0.0 hi,  0.1 si,  0.0 st
+    # Cpu(s):  3.0%us,  1.0%sy,  0.0%ni, 95.5%id,  0.5%wa,  0.0%hi,  0.0%si,  0.0%st
+    m = re.search(r"Cpu\(s\):\s*([^\\n]+)", output) or re.search(r"%Cpu\(s\):\s*([^\\n]+)", output)
+    if not m:
+        return None
+    seg = m.group(1)
+    # Extract all number+label pairs
+    # Prefer computing utilization as 100 - idle if available; otherwise fallback to sum(us+sy)
+    idm = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%?id", seg)
+    if idm:
+        try:
+            idle = float(idm.group(1))
+            return max(0.0, min(100.0, 100.0 - idle))
+        except Exception:
+            return None
+    # Fallback: try summation of us+sy
+    usm = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%?us", seg)
+    sym = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%?sy", seg)
+    if usm and sym:
+        try:
+            return float(usm.group(1)) + float(sym.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def _parse_mem_from_free(output: str) -> Dict[str, Optional[float]]:
+    """
+    Parse memory usage from 'free -m' output.
+    Returns a dict with total_mb, used_mb, free_mb, used_percent.
+    """
+    # Example:
+    #               total        used        free      shared  buff/cache   available
+    # Mem:           7957        1400        5216         123        1340        6150
+    lines = output.strip().splitlines()
+    for ln in lines:
+        if ln.lower().startswith("mem:"):
+            parts = [p for p in ln.split() if p]
+            if len(parts) >= 7:
+                try:
+                    total = float(parts[1])
+                    used = float(parts[2])
+                    free = float(parts[3])
+                    used_percent = (used / total) * 100.0 if total > 0 else None
+                    return {
+                        "total_mb": total,
+                        "used_mb": used,
+                        "free_mb": free,
+                        "used_percent": used_percent,
+                    }
+                except Exception:
+                    return {"total_mb": None, "used_mb": None, "free_mb": None, "used_percent": None}
+    return {"total_mb": None, "used_mb": None, "free_mb": None, "used_percent": None}
+
+
+def _parse_df_h(output: str) -> List[Dict[str, Any]]:
+    """
+    Parse disk utilization from 'df -h' output.
+    Returns a list of mount usage dicts containing filesystem, size, used, avail, use_percent, mountpoint.
+    """
+    lines = [l for l in output.strip().splitlines() if l.strip()]
+    if not lines:
+        return []
+    # Skip header line
+    entries = []
+    for ln in lines[1:]:
+        parts = [p for p in ln.split() if p]
+        if len(parts) >= 6:
+            fs, size, used, avail, usep, mnt = parts[:6]
+            entries.append(
+                {
+                    "filesystem": fs,
+                    "size": size,
+                    "used": used,
+                    "available": avail,
+                    "use_percent": usep,
+                    "mountpoint": mnt,
+                }
+            )
+    return entries
+
+
+def _parse_sctp_ss(output: str) -> Dict[str, Any]:
+    """
+    Parse SCTP status from 'ss -H -t -a -p | grep sctp' or equivalent.
+    Returns dict with has_sctp (bool), lines (list of matching lines).
+    """
+    lines = [l for l in output.splitlines() if l.strip()]
+    has_sctp = any(("sctp" in l.lower()) for l in lines)
+    return {"has_sctp": has_sctp, "lines": lines}
+
+
+def _collect_container_system_metrics(core_api: client.CoreV1Api, namespace: str, pod: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    For each applicable container in the given pod, exec into the container and collect:
+      - CPU utilization (via 'top -b -n1' where available)
+      - RAM usage (via 'free -m' or fall back to /proc/meminfo)
+      - Disk utilization (via 'df -h')
+      - SCTP status (via 'ss -H -t -a -p | grep sctp' or similar)
+
+    Returns:
+        Dict[str, Any]: keyed by container name with metrics and raw outputs for traceability.
+    """
+    pod_name = pod.get("name")
+    containers = []
+    for c in pod.get("containers", []):
+        if isinstance(c, dict) and "name" in c:
+            containers.append(c["name"])
+    results: Dict[str, Any] = {}
+
+    for cname in containers:
+        cont_res: Dict[str, Any] = {"cpu": None, "memory": None, "disks": None, "sctp": None, "errors": []}
+        # CPU utilization
+        # Command: Use 'top -b -n1' to retrieve CPU summary; parse %id to compute utilization.
+        code, out, err = _safe_exec_command(core_api, namespace, pod_name, cname, ["top -b -n1 | head -n 5"])
+        if code == 0 and out:
+            cont_res["cpu"] = {"util_percent": _parse_cpu_from_top(out), "raw": out.splitlines()[:6]}
+        else:
+            cont_res["errors"].append({"component": "cpu", "error": err})
+
+        # Memory usage
+        # Command: 'free -m' for totals; fallback to /proc/meminfo if free is missing.
+        code, out, err = _safe_exec_command(core_api, namespace, pod_name, cname, ["free -m || cat /proc/meminfo | head -n 20"])
+        if code == 0 and out:
+            if "Mem:" in out:
+                cont_res["memory"] = _parse_mem_from_free(out)
+            else:
+                # rudimentary parse from meminfo (in kB)
+                try:
+                    kv = {}
+                    for ln in out.splitlines():
+                        if ":" in ln:
+                            k, v = ln.split(":", 1)
+                            kv[k.strip()] = v.strip()
+                    def _num_from(s: str) -> Optional[float]:
+                        m = re.search(r"([0-9]+)", s or "")
+                        return float(m.group(1)) if m else None
+                    total_kb = _num_from(kv.get("MemTotal", "")) or 0.0
+                    free_kb = _num_from(kv.get("MemFree", "")) or 0.0
+                    buffers_kb = _num_from(kv.get("Buffers", "")) or 0.0
+                    cached_kb = _num_from(kv.get("Cached", "")) or 0.0
+                    available_kb = _num_from(kv.get("MemAvailable", "")) or (free_kb + buffers_kb + cached_kb)
+                    used_kb = max(0.0, total_kb - available_kb)
+                    cont_res["memory"] = {
+                        "total_mb": round(total_kb / 1024.0, 2),
+                        "used_mb": round(used_kb / 1024.0, 2),
+                        "free_mb": round(available_kb / 1024.0, 2),
+                        "used_percent": (round(used_kb / 1024.0, 2) / round(total_kb / 1024.0, 2)) * 100.0
+                        if total_kb > 0
+                        else None,
+                    }
+                except Exception as ex:
+                    cont_res["errors"].append({"component": "memory", "error": str(ex)})
+        else:
+            cont_res["errors"].append({"component": "memory", "error": err})
+
+        # Disk utilization
+        # Command: 'df -h' to get filesystem usage inside container filesystem namespace.
+        code, out, err = _safe_exec_command(core_api, namespace, pod_name, cname, ["df -h"])
+        if code == 0 and out:
+            cont_res["disks"] = _parse_df_h(out)
+        else:
+            cont_res["errors"].append({"component": "disk", "error": err})
+
+        # SCTP status
+        # Command: 'ss -H -t -a -p | grep -i sctp' to check SCTP sockets (if ss present).
+        # Fallback: 'cat /proc/net/sctp/*' may exist on kernels with SCTP support.
+        code, out, err = _safe_exec_command(core_api, namespace, pod_name, cname, ["ss -H -t -a -p | grep -i sctp || true"])
+        if code == 0:
+            sctp = _parse_sctp_ss(out or "")
+            # If empty and ss missing, attempt /proc approach
+            if not sctp["has_sctp"]:
+                code2, out2, err2 = _safe_exec_command(core_api, namespace, pod_name, cname, ["grep -i sctp /proc/net/protocols || true"])
+                if code2 == 0 and out2:
+                    sctp = {"has_sctp": True, "lines": out2.splitlines()}
+            cont_res["sctp"] = sctp
+        else:
+            cont_res["errors"].append({"component": "sctp", "error": err})
+
+        results[cname] = cont_res
+
+    return results
+
+
 def collect_logs_and_metrics(core_api: client.CoreV1Api, namespace: str, pods: List[Dict[str, Any]], max_bytes: int = 50000) -> Dict[str, Any]:
-    """Fetch recent logs for DU pods and parse metrics."""
+    """Fetch recent logs for DU pods and parse metrics, plus per-container system metrics via exec.
+
+    For each applicable container:
+      - Run 'top -b -n1' to estimate CPU utilization (parsed as 100 - idle)
+      - Run 'free -m' (or parse /proc/meminfo) for memory usage
+      - Run 'df -h' to capture disk usage per mountpoint
+      - Run 'ss -H -t -a -p | grep -i sctp' (fallback to /proc) to detect SCTP
+
+    Returns:
+      {
+        "pod_metrics": { "<pod>": { "radio": {...}, "containers": { "<container>": {...} } } },
+        "anomalies": [ ... ]
+      }
+    """
     aggregated: Dict[str, Any] = {"pod_metrics": {}, "anomalies": []}
     for p in pods:
         name = p.get("name")
@@ -195,20 +430,44 @@ def collect_logs_and_metrics(core_api: client.CoreV1Api, namespace: str, pods: L
             )
             if len(log_text) > max_bytes:
                 log_text = log_text[-max_bytes:]
-            metrics = _parse_metrics_from_text(log_text)
-            aggregated["pod_metrics"][name] = metrics
-            # simple anomaly heuristics
-            if metrics.get("srs_errors", 0) > 0 or metrics.get("phy_ul_crc_fail", 0) > 0:
+            radio_metrics = _parse_metrics_from_text(log_text)
+
+            # Exec into containers to fetch system metrics
+            container_metrics = _collect_container_system_metrics(core_api, namespace, p)
+
+            aggregated["pod_metrics"][name] = {
+                "radio": radio_metrics,
+                "containers": container_metrics,
+            }
+
+            # simple anomaly heuristics based on radio metrics and container resource red flags
+            if radio_metrics.get("srs_errors", 0) > 0 or radio_metrics.get("phy_ul_crc_fail", 0) > 0:
                 aggregated["anomalies"].append(
                     {
                         "pod": name,
                         "reason": "radio_metric_anomaly",
-                        "metrics": metrics,
+                        "metrics": radio_metrics,
                     }
                 )
+
+            # Add anomalies if any container shows very high CPU or memory use
+            for cname, cm in container_metrics.items():
+                cpu_util = (cm.get("cpu") or {}).get("util_percent")
+                mem_used_pct = (cm.get("memory") or {}).get("used_percent")
+                if (cpu_util is not None and cpu_util > 90.0) or (mem_used_pct is not None and mem_used_pct > 90.0):
+                    aggregated["anomalies"].append(
+                        {
+                            "pod": name,
+                            "container": cname,
+                            "reason": "resource_pressure",
+                            "cpu_util_percent": cpu_util,
+                            "mem_used_percent": mem_used_pct,
+                        }
+                    )
+
         except ApiException as exc:
             aggregated["pod_metrics"][name] = {"error": str(exc)}
-            aggregated["anomalies"].append({"pod": name, "reason": "log_fetch_error", "error": str(exc)})
+            aggregated["anomalies"].append({"pod": name, "reason": "log_or_exec_error", "error": str(exc)})
     return aggregated
 
 

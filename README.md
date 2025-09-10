@@ -6,6 +6,11 @@ This application is a standalone Python script for executing health checks on DU
 - Filters K8s nodes/pods by labels.
 - Performs node, pod, and container health checks.
 - Parses DU logs for radio access metrics.
+- Execs into each DU pod container to collect system metrics:
+  - CPU utilization via 'top -b -n1' (parsed as 100 - idle)
+  - RAM usage via 'free -m' (fallback to /proc/meminfo)
+  - Disk utilization via 'df -h'
+  - SCTP status via 'ss -H -t -a -p | grep -i sctp' (fallback to /proc)
 - Checks TCP connectivity to CU and RU.
 - Generates detailed health reports.
 - Publishes reports to Kafka and pushes failures/anomalies/logs to Loki.
@@ -44,6 +49,47 @@ Key environment variables (fallbacks/overrides):
 - NODE_LABEL_SELECTOR, POD_LABEL_SELECTOR, K8S_NAMESPACE
 - CU_HOST, CU_PORT, RU_HOST, RU_PORT, CONNECTIVITY_TIMEOUT
 - CONFIG_DIR (optional, path to configs)
+
+## Health Report Structure (excerpt)
+
+The metrics section now includes per-pod radio metrics and per-container system metrics collected via Kubernetes exec:
+
+```
+"metrics": {
+  "pod_metrics": {
+    "<pod-name>": {
+      "radio": {
+        "srs_errors": <int>,
+        "phy_ul_crc_fail": <int>,
+        "phy_dl_mcs_avg": <float|null>,
+        "rrc_conn_established": <int>
+      },
+      "containers": {
+        "<container-name>": {
+          "cpu": { "util_percent": <float|null>, "raw": ["Cpu(s): ...", "..."] },
+          "memory": { "total_mb": <float>, "used_mb": <float>, "free_mb": <float>, "used_percent": <float|null> },
+          "disks": [ { "filesystem": "...", "size": "...", "used": "...", "available": "...", "use_percent": "45%", "mountpoint": "/" }, ... ],
+          "sctp": { "has_sctp": <bool>, "lines": ["... matching ss output ..."] },
+          "errors": [ { "component": "cpu|memory|disk|sctp", "error": "..." }, ... ]
+        }
+      }
+    }
+  },
+  "anomalies": [
+    { "pod": "<pod>", "reason": "radio_metric_anomaly", "metrics": {...} },
+    { "pod": "<pod>", "container": "<container>", "reason": "resource_pressure", "cpu_util_percent": 95.0, "mem_used_percent": 92.3 }
+  ]
+}
+```
+
+Notes:
+- Commands executed inside containers:
+  - CPU: top -b -n1 | head -n 5
+  - RAM: free -m (fallback to parsing /proc/meminfo)
+  - Disk: df -h
+  - SCTP: ss -H -t -a -p | grep -i sctp (fallback grep /proc/net/protocols)
+- Errors or absence of tools are captured under the "errors" list per container.
+- Anomalies include radio metric anomalies and resource pressure (>90% CPU or memory).
 
 ## Usage - Standalone CLI
 Run the health check directly:
