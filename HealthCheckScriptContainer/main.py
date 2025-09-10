@@ -28,18 +28,13 @@ import logging
 from typing import Any, Dict, Optional
 
 from app.config import AppConfig
-from app.utils import (
-    setup_logging,
-    fetch_kubeconfig_from_vault,
-    build_k8s_client_from_kubeconfig,
-    list_nodes,
-    list_pods,
-    collect_logs_and_metrics,
-    tcp_connectivity_check,
-    build_health_report,
-    send_to_kafka,
-    push_to_loki,
-)
+from app.utils import setup_logging  # thin wrapper
+from app.vault_utils import fetch_kubeconfig_from_vault
+from app.kube_utils import build_k8s_client_from_kubeconfig, list_nodes, list_pods
+from app.metrics_utils import collect_logs_and_metrics
+from app.connectivity_utils import tcp_connectivity_check
+from app.report_utils import build_health_report
+from app.publishers import send_to_kafka, push_to_loki
 from app.logging_utils import LogContext, log_with, new_trace_id
 
 
