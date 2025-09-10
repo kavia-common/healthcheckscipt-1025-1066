@@ -18,8 +18,8 @@ component_ctx: ContextVar[str] = ContextVar("component", default="du-healthcheck
 class JsonFormatter(logging.Formatter):
     """JSON formatter that emits structured log records with contextual metadata."""
 
-    def format(self, record: logging.LogRecord) -> str:
-        payload: Dict[str, Any] = {
+    def _base_payload(self, record: logging.LogRecord) -> Dict[str, Any]:
+        return {
             "ts": int(time.time() * 1000),
             "level": record.levelname,
             "logger": record.name,
@@ -31,31 +31,35 @@ class JsonFormatter(logging.Formatter):
             "component": getattr(record, "component", None) or component_ctx.get(),
         }
 
-        # Enrich with context defaults if not set
-        if payload["site_id"] is None:
+    def _enrich_context_defaults(self, payload: Dict[str, Any]) -> None:
+        if payload.get("site_id") is None:
             payload["site_id"] = site_id_ctx.get()
-        if not payload["environment"]:
+        if not payload.get("environment"):
             payload["environment"] = environment_ctx.get()
-        if not payload["namespace"]:
+        if not payload.get("namespace"):
             payload["namespace"] = namespace_ctx.get()
 
-        # Add python/process metadata
+    def _attach_process_meta(self, record: logging.LogRecord, payload: Dict[str, Any]) -> None:
         payload["pid"] = os.getpid()
         payload["hostname"] = os.getenv("HOSTNAME", "")
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
 
-        # Include any extra keys passed via logger.bind-like pattern (record.__dict__)
+    def _attach_extra(self, record: logging.LogRecord, payload: Dict[str, Any]) -> None:
         for k, v in record.__dict__.items():
             if k in payload or k in ("msg", "args", "exc_info", "exc_text", "stack_info", "stacklevel"):
                 continue
-            # Keep simple types only to ensure JSON serialization
             try:
                 json.dumps({k: v})
                 payload[k] = v
             except Exception:
                 payload[k] = str(v)
 
+    def format(self, record: logging.LogRecord) -> str:
+        payload: Dict[str, Any] = self._base_payload(record)
+        self._enrich_context_defaults(payload)
+        self._attach_process_meta(record, payload)
+        self._attach_extra(record, payload)
         return json.dumps(payload, ensure_ascii=False)
 
 

@@ -172,10 +172,8 @@ class AppConfig:
             if hasattr(self, k):
                 setattr(self, k, v)
 
-    def validate(self) -> None:
-        """Validate required configuration for runtime (after loading)."""
+    def _collect_missing(self) -> Dict[str, Any]:
         missing: Dict[str, Any] = {}
-
         if not self.vault_addr:
             missing["VAULT_ADDR"] = "Vault address required to retrieve kubeconfig"
         if not self.vault_token:
@@ -186,7 +184,11 @@ class AppConfig:
             missing["KAFKA_BOOTSTRAP_SERVERS"] = "Kafka bootstrap servers required"
         if not self.loki_url:
             missing["LOKI_URL"] = "Loki HTTP push URL required"
+        return missing
 
+    def validate(self) -> None:
+        """Validate required configuration for runtime (after loading)."""
+        missing = self._collect_missing()
         if missing:
             details = ", ".join([f"{k}: {v}" for k, v in missing.items()])
             raise ValueError(f"Invalid configuration. Missing variables: {details}")

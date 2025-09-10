@@ -5,33 +5,22 @@ from .logging_utils import LogContext, new_trace_id, log_with
 from . import config as _config
 from ..main import run_cli  # type: ignore
 
-# PUBLIC_INTERFACE
-def run_healthcheck(site_id: Optional[str] = None, environment: Optional[str] = None) -> Dict[str, Any]:
-    """Airflow-compatible callable to execute DU health checks without HTTP.
-
-    This function simply defers to the standalone CLI/main implementation to
-    keep import paths stable for existing DAGs:
-
-        from app.airflow_entrypoint import run_healthcheck
-
-    Args:
-        site_id: Optional site identifier to include in the report.
-        environment: Optional environment override (dev|stage|prod).
-
-    Returns:
-        Dict[str, Any]: Structured health report dictionary.
-    """
+def _airflow_overrides(cfg: _config.AppConfig, environment: Optional[str]) -> Dict[str, Any]:
     overrides: Dict[str, Any] = {}
-    cfg = _config.AppConfig()
-    cfg.load_from_files_and_env(env_override=environment)
-
     if environment:
         overrides["environment"] = environment
-    if cfg:
-        overrides["namespace"] = cfg.namespace
-        overrides["node_label_selector"] = cfg.node_label_selector
-        overrides["pod_label_selector"] = cfg.pod_label_selector
+    overrides["namespace"] = cfg.namespace
+    overrides["node_label_selector"] = cfg.node_label_selector
+    overrides["pod_label_selector"] = cfg.pod_label_selector
+    return overrides
 
+
+# PUBLIC_INTERFACE
+def run_healthcheck(site_id: Optional[str] = None, environment: Optional[str] = None) -> Dict[str, Any]:
+    """Airflow-compatible callable to execute DU health checks without HTTP."""
+    cfg = _config.AppConfig()
+    cfg.load_from_files_and_env(env_override=environment)
+    overrides = _airflow_overrides(cfg, environment)
     trace = new_trace_id()
     logger = logging.getLogger("du-healthcheck")
     with LogContext(trace_id=trace, site_id=site_id or cfg.site_id, environment=environment or cfg.environment, namespace=cfg.namespace):

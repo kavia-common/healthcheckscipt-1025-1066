@@ -49,10 +49,11 @@ def _apply_overrides(cfg: AppConfig, site_id: Optional[str], environment: Option
         cfg.environment = environment
     if site_id is not None:
         cfg.site_id = site_id
-    if overrides:
-        for k, v in overrides.items():
-            if hasattr(cfg, k) and v is not None:
-                setattr(cfg, k, v)
+    if not overrides:
+        return
+    for k, v in overrides.items():
+        if hasattr(cfg, k) and v is not None:
+            setattr(cfg, k, v)
 
 
 def _build_connectivity(cfg: AppConfig) -> Dict[str, Any]:
@@ -95,65 +96,71 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# PUBLIC_INTERFACE
-def run_cli(site_id: Optional[str] = None, environment: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Run the DU health check workflow as a function suitable for Airflow or direct import.
-
-    Args:
-        site_id: Optional site identifier to include in the report (overrides env).
-        environment: Optional environment override (dev|stage|prod).
-        overrides: Optional dict of config field overrides (e.g., namespace, selectors).
-
-    Returns:
-        Dict[str, Any]: Structured health report to be printed or returned to schedulers.
-    """
+# Internal helpers for run_cli to keep function size small
+def _load_config(site_id: Optional[str], environment: Optional[str], overrides: Optional[Dict[str, Any]]) -> AppConfig:
     cfg = AppConfig()
     cfg.load_from_files_and_env(env_override=environment)
     _apply_overrides(cfg, site_id, environment, overrides)
+    return cfg
 
+
+def _log_effective_config(logger: logging.Logger, cfg: AppConfig) -> None:
+    log_with(
+        logger,
+        logging.DEBUG,
+        event="config_effective",
+        environment=cfg.environment,
+        site_id=cfg.site_id,
+        namespace=cfg.namespace,
+        node_label_selector=cfg.node_label_selector,
+        pod_label_selector=cfg.pod_label_selector,
+    )
+
+
+def _prepare_k8s(logger: logging.Logger, cfg: AppConfig):
+    kubeconfig = fetch_kubeconfig_from_vault(
+        cfg.vault_addr, cfg.vault_token, cfg.vault_kubeconfig_path, timeout=cfg.request_timeout
+    )
+    log_with(logger, logging.INFO, event="vault_kubeconfig_fetched")
+    core_api, _ = build_k8s_client_from_kubeconfig(kubeconfig)
+    log_with(logger, logging.INFO, event="k8s_client_ready")
+    return core_api
+
+
+def _discover_cluster(logger: logging.Logger, core_api, cfg: AppConfig):
+    nodes = list_nodes(core_api, cfg.node_label_selector)
+    log_with(logger, logging.INFO, event="nodes_discovered", count=len(nodes))
+    pods = list_pods(core_api, cfg.namespace, cfg.pod_label_selector)
+    log_with(logger, logging.INFO, event="pods_discovered", count=len(pods))
+    return nodes, pods
+
+
+def _gather_metrics_and_connectivity(logger: logging.Logger, core_api, cfg: AppConfig, pods):
+    metrics = collect_logs_and_metrics(core_api, cfg.namespace, pods)
+    log_with(logger, logging.INFO, event="metrics_collected")
+    connectivity = _build_connectivity(cfg)
+    log_with(logger, logging.INFO, event="connectivity_complete", cu=connectivity.get("cu"), ru=connectivity.get("ru"))
+    return metrics, connectivity
+
+
+# PUBLIC_INTERFACE
+def run_cli(site_id: Optional[str] = None, environment: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Run the DU health check workflow."""
+    cfg = _load_config(site_id, environment, overrides)
     logger = setup_logging(cfg.log_level)
-
     trace = new_trace_id()
+
     with LogContext(trace_id=trace, site_id=cfg.site_id, environment=cfg.environment, namespace=cfg.namespace):
         log_with(logger, logging.INFO, event="run_start", message="Starting DU health check")
-        log_with(
-            logger,
-            logging.DEBUG,
-            event="config_effective",
-            environment=cfg.environment,
-            site_id=cfg.site_id,
-            namespace=cfg.namespace,
-            node_label_selector=cfg.node_label_selector,
-            pod_label_selector=cfg.pod_label_selector,
-        )
-
+        _log_effective_config(logger, cfg)
         try:
-            kubeconfig = fetch_kubeconfig_from_vault(
-                cfg.vault_addr, cfg.vault_token, cfg.vault_kubeconfig_path, timeout=cfg.request_timeout
-            )
-            log_with(logger, logging.INFO, event="vault_kubeconfig_fetched")
-
-            core_api, _ = build_k8s_client_from_kubeconfig(kubeconfig)
-            log_with(logger, logging.INFO, event="k8s_client_ready")
-
-            nodes = list_nodes(core_api, cfg.node_label_selector)
-            log_with(logger, logging.INFO, event="nodes_discovered", count=len(nodes))
-
-            pods = list_pods(core_api, cfg.namespace, cfg.pod_label_selector)
-            log_with(logger, logging.INFO, event="pods_discovered", count=len(pods))
-
-            metrics = collect_logs_and_metrics(core_api, cfg.namespace, pods)
-            log_with(logger, logging.INFO, event="metrics_collected")
-
-            connectivity = _build_connectivity(cfg)
-            log_with(logger, logging.INFO, event="connectivity_complete", cu=connectivity.get("cu"), ru=connectivity.get("ru"))
-
+            core_api = _prepare_k8s(logger, cfg)
+            nodes, pods = _discover_cluster(logger, core_api, cfg)
+            metrics, connectivity = _gather_metrics_and_connectivity(logger, core_api, cfg, pods)
             report = build_health_report(cfg.site_id, cfg.environment, nodes, pods, connectivity, metrics)
             result_json = _report_to_dict(report)
-
             log_with(logger, logging.INFO, event="run_end", status=result_json.get("status"))
             return result_json
-
         except Exception as exc:
             log_with(logger, logging.ERROR, event="run_exception", error=str(exc))
             raise
@@ -212,6 +219,20 @@ def _build_overrides_from_args(args: argparse.Namespace) -> Dict[str, Any]:
     return overrides
 
 
+def _push_loki_on_kafka_failure(cfg: AppConfig, logger: logging.Logger, exc: Exception) -> None:
+    try:
+        push_to_loki(
+            cfg.loki_url,
+            cfg.loki_tenant_id,
+            cfg.loki_labels,
+            [{"level": "error", "event": "kafka_publish_failed", "error": str(exc), "site_id": cfg.site_id}],
+            logger,
+        )
+    except Exception:
+        # Swallow; already logged inside push_to_loki
+        pass
+
+
 def _publish_to_kafka_safe(cfg: AppConfig, result: Dict[str, Any], logger: logging.Logger, also_push_loki: bool) -> None:
     """Publish to Kafka and optionally emit a Loki error if publish fails."""
     try:
@@ -221,35 +242,32 @@ def _publish_to_kafka_safe(cfg: AppConfig, result: Dict[str, Any], logger: loggi
     except Exception as exc:
         log_with(logger, logging.ERROR, event="publish_kafka_error", error=str(exc))
         if also_push_loki:
-            try:
-                push_to_loki(
-                    cfg.loki_url,
-                    cfg.loki_tenant_id,
-                    cfg.loki_labels,
-                    [{"level": "error", "event": "kafka_publish_failed", "error": str(exc), "site_id": cfg.site_id}],
-                    logger,
-                )
-            except Exception:
-                # Swallow; already logged inside push_to_loki
-                pass
+            _push_loki_on_kafka_failure(cfg, logger, exc)
+
+
+def _append_anomaly_entries(entries: list, metrics: Dict[str, Any], site_id: Optional[str]) -> None:
+    anomalies = metrics.get("anomalies") if isinstance(metrics, dict) else None
+    if not anomalies:
+        return
+    for a in anomalies:
+        entries.append({"level": "warn", "event": "anomaly", "details": a, "site_id": site_id})
+
+
+def _summary_entry(result: Dict[str, Any], site_id: Optional[str]) -> Dict[str, Any]:
+    return {
+        "level": "info",
+        "event": "du_health_summary",
+        "summary": result.get("summary"),
+        "status": result.get("status"),
+        "site_id": site_id,
+    }
 
 
 def _build_loki_entries(result: Dict[str, Any], site_id: Optional[str]) -> Dict[str, Any]:
     """Build a list of Loki entries from the result payload."""
-    entries = []
-    metrics = result.get("metrics", {})
-    if isinstance(metrics, dict) and metrics.get("anomalies"):
-        for a in metrics["anomalies"]:
-            entries.append({"level": "warn", "event": "anomaly", "details": a, "site_id": site_id})
-    entries.append(
-        {
-            "level": "info",
-            "event": "du_health_summary",
-            "summary": result.get("summary"),
-            "status": result.get("status"),
-            "site_id": site_id,
-        }
-    )
+    entries: list = []
+    _append_anomaly_entries(entries, result.get("metrics", {}), site_id)
+    entries.append(_summary_entry(result, site_id))
     return entries
 
 

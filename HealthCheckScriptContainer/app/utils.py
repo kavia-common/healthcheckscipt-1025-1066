@@ -166,6 +166,44 @@ def list_nodes(core_api: client.CoreV1Api, label_selector: str) -> List[Dict[str
 
 
 # PUBLIC_INTERFACE
+def _container_statuses_for_pod(p) -> List[Dict[str, Any]]:
+    statuses = []
+    if not p.status.container_statuses:
+        return statuses
+    for cs in p.status.container_statuses:
+        statuses.append(_single_container_status_dict(cs))
+    return statuses
+
+
+def _single_container_status_dict(cs) -> Dict[str, Any]:
+    state = "unknown"
+    if cs.state.waiting:
+        state = f"waiting:{cs.state.waiting.reason}"
+    elif cs.state.terminated:
+        state = f"terminated:{cs.state.terminated.reason}"
+    elif cs.state.running:
+        state = "running"
+    return {
+        "name": cs.name,
+        "ready": cs.ready,
+        "restarts": cs.restart_count,
+        "state": state,
+        "image": cs.image,
+    }
+
+
+def _pod_entry_from_obj(p, container_statuses: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "name": p.metadata.name,
+        "namespace": p.metadata.namespace,
+        "phase": p.status.phase,
+        "hostIP": p.status.host_ip,
+        "podIP": p.status.pod_ip,
+        "labels": p.metadata.labels or {},
+        "containers": container_statuses,
+    }
+
+
 def list_pods(core_api: client.CoreV1Api, namespace: str, label_selector: str) -> List[Dict[str, Any]]:
     """List Pods by namespace and label selector with container statuses."""
     logger = logging.getLogger("du-healthcheck")
@@ -174,35 +212,8 @@ def list_pods(core_api: client.CoreV1Api, namespace: str, label_selector: str) -
     try:
         pods = core_api.list_namespaced_pod(namespace=namespace, label_selector=label_selector).items
         for p in pods:
-            container_statuses = []
-            if p.status.container_statuses:
-                for cs in p.status.container_statuses:
-                    restarts = cs.restart_count
-                    state = "unknown"
-                    if cs.state.waiting:
-                        state = f"waiting:{cs.state.waiting.reason}"
-                    elif cs.state.terminated:
-                        state = f"terminated:{cs.state.terminated.reason}"
-                    elif cs.state.running:
-                        state = "running"
-                    container_statuses.append(
-                        {
-                            "name": cs.name,
-                            "ready": cs.ready,
-                            "restarts": restarts,
-                            "state": state,
-                            "image": cs.image,
-                        }
-                    )
-            pod_entry = {
-                "name": p.metadata.name,
-                "namespace": p.metadata.namespace,
-                "phase": p.status.phase,
-                "hostIP": p.status.host_ip,
-                "podIP": p.status.pod_ip,
-                "labels": p.metadata.labels or {},
-                "containers": container_statuses,
-            }
+            container_statuses = _container_statuses_for_pod(p)
+            pod_entry = _pod_entry_from_obj(p, container_statuses)
             pods_info.append(pod_entry)
             log_with(
                 logger,
@@ -229,35 +240,32 @@ def _parse_metrics_from_text(log_text: str) -> Dict[str, Any]:
         "rrc_conn_established": 0,
     }
     for line in log_text.splitlines():
-        l = line.lower()
-        if "srs error" in l:
-            metrics["srs_errors"] += 1
-        if "crc" in l and "ul" in l and ("fail" in l or "error" in l):
-            metrics["phy_ul_crc_fail"] += 1
-        if "dl mcs avg" in l:
-            try:
-                # grab number at end of line
-                num_str = "".join([c for c in line if (c.isdigit() or c == "." or c == "-")])
-                if num_str:
-                    metrics["phy_dl_mcs_avg"] = float(num_str)
-            except Exception:
-                pass
-        if "rrc connection established" in l or "rrc: established" in l:
-            metrics["rrc_conn_established"] += 1
+        lower = line.lower()
+        _update_metrics_from_line(metrics, line, lower)
     return metrics
+
+
+def _update_metrics_from_line(metrics: Dict[str, Any], line: str, lower: str) -> None:
+    if "srs error" in lower:
+        metrics["srs_errors"] += 1
+    if "crc" in lower and "ul" in lower and ("fail" in lower or "error" in lower):
+        metrics["phy_ul_crc_fail"] += 1
+    if "dl mcs avg" in lower:
+        try:
+            num_str = "".join([c for c in line if (c.isdigit() or c == "." or c == "-")])
+            if num_str:
+                metrics["phy_dl_mcs_avg"] = float(num_str)
+        except Exception:
+            pass
+    if "rrc connection established" in lower or "rrc: established" in lower:
+        metrics["rrc_conn_established"] += 1
 
 
 # PUBLIC_INTERFACE
 def _safe_exec_command(core_api: client.CoreV1Api, namespace: str, pod: str, container: str, command: List[str], timeout_seconds: int = 8) -> Tuple[int, str, str]:
-    """
-    Execute a command in a container using Kubernetes exec and return (exit_code, stdout, stderr).
-
-    Commands are executed with /bin/sh -c to maximize compatibility across distros.
-    """
-    # Use /bin/sh -c "user command" for portability
+    """Exec command in container; returns (exit_code, stdout, stderr)."""
     full_cmd = ["/bin/sh", "-c", " ".join(command)]
     try:
-        # stream returns the command output; capture stderr by enabling _preload_content=False if needed
         resp = stream(
             core_api.connect_get_namespaced_pod_exec,
             pod,
@@ -270,9 +278,6 @@ def _safe_exec_command(core_api: client.CoreV1Api, namespace: str, pod: str, con
             tty=False,
             _request_timeout=timeout_seconds,
         )
-        # When preload is True (default here), resp is stdout text, and Kubernetes does not expose exit code directly.
-        # We heuristically set exit_code=0 if no stderr indicator. For robustness re-run with 'sh -c "<cmd>; echo $? >&2"'
-        # However that complicates parsing; we will consider non-empty output as success.
         return 0, resp or "", ""
     except Exception as exc:
         return 1, "", str(exc)
@@ -406,6 +411,34 @@ def _collect_cpu_metric(core_api: client.CoreV1Api, namespace: str, pod_name: st
         cont_res["errors"].append({"component": "cpu", "error": err})
 
 
+def _parse_proc_meminfo_to_kv(text: str) -> Dict[str, str]:
+    kv: Dict[str, str] = {}
+    for ln in text.splitlines():
+        if ":" in ln:
+            k, v = ln.split(":", 1)
+            kv[k.strip()] = v.strip()
+    return kv
+
+
+def _num_from_text(s: str) -> Optional[float]:
+    m = re.search(r"([0-9]+)", s or "")
+    return float(m.group(1)) if m else None
+
+
+def _mem_calculate_from_kv(kv: Dict[str, str]) -> Dict[str, Optional[float]]:
+    total_kb = _num_from_text(kv.get("MemTotal", "")) or 0.0
+    free_kb = _num_from_text(kv.get("MemFree", "")) or 0.0
+    buffers_kb = _num_from_text(kv.get("Buffers", "")) or 0.0
+    cached_kb = _num_from_text(kv.get("Cached", "")) or 0.0
+    available_kb = _num_from_text(kv.get("MemAvailable", "")) or (free_kb + buffers_kb + cached_kb)
+    used_kb = max(0.0, total_kb - available_kb)
+    total_mb = round(total_kb / 1024.0, 2)
+    used_mb = round(used_kb / 1024.0, 2)
+    free_mb = round(available_kb / 1024.0, 2)
+    used_percent = (used_mb / total_mb) * 100.0 if total_kb > 0 else None
+    return {"total_mb": total_mb, "used_mb": used_mb, "free_mb": free_mb, "used_percent": used_percent}
+
+
 def _collect_memory_metric(core_api: client.CoreV1Api, namespace: str, pod_name: str, cname: str, cont_res: Dict[str, Any]) -> None:
     """Populate memory metric for container."""
     code, out, err = _safe_exec_command(core_api, namespace, pod_name, cname, ["free -m || cat /proc/meminfo | head -n 20"])
@@ -416,26 +449,8 @@ def _collect_memory_metric(core_api: client.CoreV1Api, namespace: str, pod_name:
         cont_res["memory"] = _parse_mem_from_free(out)
         return
     try:
-        kv = {}
-        for ln in out.splitlines():
-            if ":" in ln:
-                k, v = ln.split(":", 1)
-                kv[k.strip()] = v.strip()
-        def _num_from(s: str) -> Optional[float]:
-            m = re.search(r"([0-9]+)", s or "")
-            return float(m.group(1)) if m else None
-        total_kb = _num_from(kv.get("MemTotal", "")) or 0.0
-        free_kb = _num_from(kv.get("MemFree", "")) or 0.0
-        buffers_kb = _num_from(kv.get("Buffers", "")) or 0.0
-        cached_kb = _num_from(kv.get("Cached", "")) or 0.0
-        available_kb = _num_from(kv.get("MemAvailable", "")) or (free_kb + buffers_kb + cached_kb)
-        used_kb = max(0.0, total_kb - available_kb)
-        cont_res["memory"] = {
-            "total_mb": round(total_kb / 1024.0, 2),
-            "used_mb": round(used_kb / 1024.0, 2),
-            "free_mb": round(available_kb / 1024.0, 2),
-            "used_percent": (round(used_kb / 1024.0, 2) / round(total_kb / 1024.0, 2)) * 100.0 if total_kb > 0 else None,
-        }
+        kv = _parse_proc_meminfo_to_kv(out)
+        cont_res["memory"] = _mem_calculate_from_kv(kv)
     except Exception as ex:
         cont_res["errors"].append({"component": "memory", "error": str(ex)})
 
@@ -464,16 +479,7 @@ def _collect_sctp_metric(core_api: client.CoreV1Api, namespace: str, pod_name: s
 
 
 def _collect_container_system_metrics(core_api: client.CoreV1Api, namespace: str, pod: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    For each applicable container in the given pod, exec into the container and collect:
-      - CPU utilization (via 'top -b -n1' where available)
-      - RAM usage (via 'free -m' or fall back to /proc/meminfo)
-      - Disk utilization (via 'df -h')
-      - SCTP status (via 'ss -H -t -a -p | grep sctp' or similar)
-
-    Returns:
-        Dict[str, Any]: keyed by container name with metrics and raw outputs for traceability.
-    """
+    """Collect per-container system metrics for a pod."""
     pod_name = pod.get("name")
     containers = _container_names_from_pod(pod)
     results: Dict[str, Any] = {}
