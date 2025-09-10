@@ -174,3 +174,13 @@ Secrets and configuration:
 - The previous Flask app and HTTP endpoints have been removed.
 - OpenAPI docs and /docs are not applicable anymore.
 - External systems (Vault, Kubernetes, Kafka, Loki) must be reachable.
+
+## Code-size diagnostics (developer aid)
+To measure function sizes and file lengths for refactoring, run:
+```
+python HealthCheckScriptContainer/tools/line_diagnostics.py
+```
+This prints:
+- Functions exceeding 15 physical code lines (excluding comments/blank lines)
+- Percentage of functions with length ≤ 15
+- Files exceeding 400 total lines and their lengths
