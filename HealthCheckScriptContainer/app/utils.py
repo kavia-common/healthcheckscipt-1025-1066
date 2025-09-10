@@ -13,33 +13,26 @@ from kubernetes.client import ApiException
 from kubernetes.stream import stream
 from confluent_kafka import Producer
 
+from .logging_utils import log_with, setup_logging as setup_structured_logging, trace_id_ctx
+
 
 # PUBLIC_INTERFACE
 def setup_logging(level: str = "INFO") -> logging.Logger:
-    """Initialize and return a configured logger based on provided log level."""
-    log_level = getattr(logging, level.upper(), logging.INFO)
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-    )
-    logger = logging.getLogger("du-healthcheck")
-    logger.setLevel(log_level)
-    return logger
+    """Initialize and return a configured logger (structured JSON)."""
+    return setup_structured_logging(level)
 
 
 # PUBLIC_INTERFACE
 def fetch_kubeconfig_from_vault(vault_addr: str, token: str, secret_path: str, timeout: float = 8.0) -> str:
     """Fetch kubeconfig content from HashiCorp Vault KV v2 and return as a string."""
+    logger = logging.getLogger("du-healthcheck")
     # Detect if path is kv-v2 and build URL format: /v1/<mount>/data/<path>
-    # Allow user to pass full path; we try both direct and kv v2 path form.
     headers = {"X-Vault-Token": token}
     session = requests.Session()
     session.headers.update(headers)
     urls = [
         f"{vault_addr}/v1/{secret_path}",
     ]
-
-    # Attempt to construct kv-v2 path automatically if not already a /data/ URL
     if "/data/" not in secret_path:
         parts = secret_path.split("/", 1)
         if len(parts) == 2:
@@ -48,16 +41,45 @@ def fetch_kubeconfig_from_vault(vault_addr: str, token: str, secret_path: str, t
     last_error: Optional[Exception] = None
     for url in urls:
         try:
+            log_with(
+                logger,
+                logging.INFO,
+                event="vault_request_start",
+                trace_id=trace_id_ctx.get(),
+                url=url,
+                timeout=timeout,
+            )
             resp = session.get(url, timeout=timeout)
+            status = resp.status_code
+            log_with(
+                logger,
+                logging.INFO,
+                event="vault_request_end",
+                status_code=status,
+                ok=status < 400,
+            )
             resp.raise_for_status()
             payload = resp.json()
-            # KV v2 puts secret at data.data, KV v1 would be at data directly
             if "data" in payload and isinstance(payload["data"], dict) and "data" in payload["data"]:
-                return payload["data"]["data"].get("kubeconfig", "")
+                kube = payload["data"]["data"].get("kubeconfig", "")
+                if not kube:
+                    raise RuntimeError("kubeconfig_empty")
+                return kube
             if "data" in payload and isinstance(payload["data"], dict):
-                return payload["data"].get("kubeconfig", "")
+                kube = payload["data"].get("kubeconfig", "")
+                if not kube:
+                    raise RuntimeError("kubeconfig_empty")
+                return kube
+            raise RuntimeError("unexpected_vault_payload")
         except Exception as exc:
             last_error = exc
+            log_with(
+                logger,
+                logging.ERROR,
+                event="vault_request_error",
+                error=str(exc),
+                url=url,
+            )
             continue
     raise RuntimeError(f"Failed to retrieve kubeconfig from Vault: {last_error}")
 
@@ -65,14 +87,20 @@ def fetch_kubeconfig_from_vault(vault_addr: str, token: str, secret_path: str, t
 # PUBLIC_INTERFACE
 def build_k8s_client_from_kubeconfig(kubeconfig_content: str) -> Tuple[client.CoreV1Api, client.AppsV1Api]:
     """Build Kubernetes API clients from kubeconfig file content."""
-    # Write to a temp file (in container)
+    logger = logging.getLogger("du-healthcheck")
     tmp_path = "/tmp/kubeconfig_du_health.yaml"
+    log_with(logger, logging.INFO, event="k8s_client_init_start", kubeconfig_path=tmp_path)
     with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(kubeconfig_content)
-    k8s_config.load_kube_config(config_file=tmp_path)
-    core_api = client.CoreV1Api()
-    apps_api = client.AppsV1Api()
-    return core_api, apps_api
+    try:
+        k8s_config.load_kube_config(config_file=tmp_path)
+        core_api = client.CoreV1Api()
+        apps_api = client.AppsV1Api()
+        log_with(logger, logging.INFO, event="k8s_client_init_end", success=True)
+        return core_api, apps_api
+    except Exception as exc:
+        log_with(logger, logging.ERROR, event="k8s_client_init_error", error=str(exc))
+        raise
 
 
 @dataclass
@@ -91,29 +119,36 @@ class HealthResult:
 # PUBLIC_INTERFACE
 def list_nodes(core_api: client.CoreV1Api, label_selector: str) -> List[Dict[str, Any]]:
     """List Kubernetes nodes by label selector and basic readiness."""
+    logger = logging.getLogger("du-healthcheck")
+    log_with(logger, logging.INFO, event="k8s_list_nodes_start", label_selector=label_selector)
     nodes_info: List[Dict[str, Any]] = []
     try:
         nodes = core_api.list_node(label_selector=label_selector).items
         for n in nodes:
             conditions = {c.type: c.status for c in (n.status.conditions or [])}
             alloc = n.status.allocatable or {}
-            nodes_info.append(
-                {
-                    "name": n.metadata.name,
-                    "labels": n.metadata.labels or {},
-                    "allocatable": {k: str(v) for k, v in alloc.items()},
-                    "conditions": conditions,
-                    "ready": conditions.get("Ready") == "True",
-                }
-            )
+            entry = {
+                "name": n.metadata.name,
+                "labels": n.metadata.labels or {},
+                "allocatable": {k: str(v) for k, v in alloc.items()},
+                "conditions": conditions,
+                "ready": conditions.get("Ready") == "True",
+            }
+            nodes_info.append(entry)
+            log_with(logger, logging.DEBUG, event="k8s_node_discovered", node=n.metadata.name, ready=entry["ready"])
+        log_with(logger, logging.INFO, event="k8s_list_nodes_end", count=len(nodes_info))
     except ApiException as exc:
-        nodes_info.append({"error": str(exc)})
+        err = str(exc)
+        nodes_info.append({"error": err})
+        log_with(logger, logging.ERROR, event="k8s_list_nodes_error", error=err)
     return nodes_info
 
 
 # PUBLIC_INTERFACE
 def list_pods(core_api: client.CoreV1Api, namespace: str, label_selector: str) -> List[Dict[str, Any]]:
     """List Pods by namespace and label selector with container statuses."""
+    logger = logging.getLogger("du-healthcheck")
+    log_with(logger, logging.INFO, event="k8s_list_pods_start", namespace=namespace, label_selector=label_selector)
     pods_info: List[Dict[str, Any]] = []
     try:
         pods = core_api.list_namespaced_pod(namespace=namespace, label_selector=label_selector).items
@@ -138,19 +173,29 @@ def list_pods(core_api: client.CoreV1Api, namespace: str, label_selector: str) -
                             "image": cs.image,
                         }
                     )
-            pods_info.append(
-                {
-                    "name": p.metadata.name,
-                    "namespace": p.metadata.namespace,
-                    "phase": p.status.phase,
-                    "hostIP": p.status.host_ip,
-                    "podIP": p.status.pod_ip,
-                    "labels": p.metadata.labels or {},
-                    "containers": container_statuses,
-                }
+            pod_entry = {
+                "name": p.metadata.name,
+                "namespace": p.metadata.namespace,
+                "phase": p.status.phase,
+                "hostIP": p.status.host_ip,
+                "podIP": p.status.pod_ip,
+                "labels": p.metadata.labels or {},
+                "containers": container_statuses,
+            }
+            pods_info.append(pod_entry)
+            log_with(
+                logger,
+                logging.DEBUG,
+                event="k8s_pod_discovered",
+                pod=p.metadata.name,
+                phase=p.status.phase,
+                containers=[c.get("name") for c in container_statuses],
             )
+        log_with(logger, logging.INFO, event="k8s_list_pods_end", count=len(pods_info))
     except ApiException as exc:
-        pods_info.append({"error": str(exc)})
+        err = str(exc)
+        pods_info.append({"error": err})
+        log_with(logger, logging.ERROR, event="k8s_list_pods_error", error=err)
     return pods_info
 
 
@@ -474,18 +519,26 @@ def collect_logs_and_metrics(core_api: client.CoreV1Api, namespace: str, pods: L
 # PUBLIC_INTERFACE
 def tcp_connectivity_check(host: Optional[str], port: int, timeout: float) -> Dict[str, Any]:
     """Check TCP connectivity to given host:port."""
+    logger = logging.getLogger("du-healthcheck")
     if not host:
-        return {"host": None, "port": port, "reachable": False, "error": "host_not_configured"}
+        res = {"host": None, "port": port, "reachable": False, "error": "host_not_configured"}
+        log_with(logger, logging.WARNING, event="tcp_check_skipped", **res)
+        return res
     start = time.time()
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
+    log_with(logger, logging.DEBUG, event="tcp_check_start", host=host, port=port, timeout=timeout)
     try:
         s.connect((host, port))
         s.shutdown(socket.SHUT_RDWR)
         elapsed = time.time() - start
-        return {"host": host, "port": port, "reachable": True, "latency_s": round(elapsed, 4)}
+        res = {"host": host, "port": port, "reachable": True, "latency_s": round(elapsed, 4)}
+        log_with(logger, logging.INFO, event="tcp_check_end", **res)
+        return res
     except Exception as exc:
-        return {"host": host, "port": port, "reachable": False, "error": str(exc)}
+        res = {"host": host, "port": port, "reachable": False, "error": str(exc)}
+        log_with(logger, logging.ERROR, event="tcp_check_error", **res)
+        return res
     finally:
         s.close()
 
@@ -530,6 +583,7 @@ def build_health_report(
 # PUBLIC_INTERFACE
 def send_to_kafka(bootstrap_servers: str, topic: str, payload: Dict[str, Any], logger: logging.Logger) -> None:
     """Send health report to Kafka topic."""
+    from .logging_utils import log_with
     conf = {
         "bootstrap.servers": bootstrap_servers,
         "client.id": f"du-healthcheck-{os.getenv('HOSTNAME', 'local')}",
@@ -537,27 +591,34 @@ def send_to_kafka(bootstrap_servers: str, topic: str, payload: Dict[str, Any], l
         "compression.type": "zstd",
         "linger.ms": 50,
     }
+    log_with(logger, logging.INFO, event="kafka_producer_init", bootstrap_servers=bootstrap_servers, topic=topic)
     producer = Producer(conf)
 
     def delivery(err, msg):
         if err is not None:
-            logger.error(f"Kafka delivery failed: {err}")
+            log_with(logger, logging.ERROR, event="kafka_delivery_failed", error=str(err))
         else:
-            logger.debug(f"Kafka delivered to {msg.topic()} [{msg.partition()}] @ {msg.offset()}")
+            log_with(
+                logger,
+                logging.DEBUG,
+                event="kafka_delivery_ok",
+                topic=msg.topic(),
+                partition=msg.partition(),
+                offset=msg.offset(),
+            )
 
     data = json.dumps(payload, default=lambda o: o.__dict__)
+    log_with(logger, logging.DEBUG, event="kafka_produce", size_bytes=len(data))
     producer.produce(topic, value=data.encode("utf-8"), callback=delivery)
     producer.flush(5)
+    log_with(logger, logging.INFO, event="kafka_flush_done")
 
 
 # PUBLIC_INTERFACE
 def push_to_loki(loki_url: str, tenant_id: Optional[str], labels: str, entries: List[Dict[str, Any]], logger: logging.Logger) -> None:
     """Push logs/entries to Loki via HTTP API."""
-    # Loki expected payload
-    # {"streams": [{"stream": {"label": "value"}, "values": [["<ns>", "<log line>"], ...]}]}
-    # labels must be as prom labels string, convert to dict as stream labels
+    from .logging_utils import log_with
     def parse_labels(labels_str: str) -> Dict[str, str]:
-        # very small parser for format: {k="v",k2="v2"}
         res = {}
         s = labels_str.strip()
         if not (s.startswith("{") and s.endswith("}")):
@@ -582,11 +643,13 @@ def push_to_loki(loki_url: str, tenant_id: Optional[str], labels: str, entries: 
     headers = {"Content-Type": "application/json"}
     if tenant_id:
         headers["X-Scope-OrgID"] = tenant_id
+    url = loki_url.rstrip("/") + "/loki/api/v1/push"
+    log_with(logger, logging.INFO, event="loki_push_start", url=url, entries=len(entries))
     try:
-        resp = requests.post(loki_url.rstrip("/") + "/loki/api/v1/push", data=json.dumps(payload), headers=headers, timeout=5)
+        resp = requests.post(url, data=json.dumps(payload), headers=headers, timeout=5)
         if resp.status_code >= 300:
-            logger.error(f"Loki push failed: {resp.status_code} {resp.text}")
+            log_with(logger, logging.ERROR, event="loki_push_failed", status_code=resp.status_code, response=resp.text[:500])
         else:
-            logger.debug("Pushed logs to Loki successfully.")
+            log_with(logger, logging.INFO, event="loki_push_ok", status_code=resp.status_code)
     except Exception as exc:
-        logger.error(f"Loki push error: {exc}")
+        log_with(logger, logging.ERROR, event="loki_push_error", error=str(exc))

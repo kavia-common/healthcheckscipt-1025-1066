@@ -15,6 +15,7 @@ This application is a standalone Python script for executing health checks on DU
 - Generates detailed health reports.
 - Publishes reports to Kafka and pushes failures/anomalies/logs to Loki.
 - Supports configurable log levels and multi-env (dev|stage|prod).
+- Structured JSON logging with per-run trace_id for correlation across Vault/K8s/Kafka/Loki calls.
 - Is schedulable (Airflow-compatible callable). No Flask / web API.
 
 ## Configuration
@@ -49,6 +50,25 @@ Key environment variables (fallbacks/overrides):
 - NODE_LABEL_SELECTOR, POD_LABEL_SELECTOR, K8S_NAMESPACE
 - CU_HOST, CU_PORT, RU_HOST, RU_PORT, CONNECTIVITY_TIMEOUT
 - CONFIG_DIR (optional, path to configs)
+
+## Structured Logging and Traceability
+
+The application uses structured JSON logging with a per-run trace_id for correlation:
+- A unique trace_id is generated at the start of each run and is propagated to all logs.
+- All major steps emit start/end logs with contextual metadata: site_id, environment, namespace.
+- External calls (Vault, Kubernetes, Kafka, Loki) include event names, URLs/topics, status codes, and errors.
+- Per-pod and per-container actions (log reads, exec commands for metrics) log detailed context including pod/container names, commands, and outcomes.
+- Exceptions are logged with error details and context for easier troubleshooting.
+
+Public helper interfaces:
+- setup_logging(level): sets up JSON logger
+- LogContext(trace_id, site_id, environment, namespace): context manager to bind correlation fields
+- log_with(logger, level, event, **fields): produce structured logs with custom fields
+
+Example log entry:
+```
+{"ts": 1736530000000, "level": "INFO", "logger": "du-healthcheck", "msg": "run_start", "event": "run_start", "trace_id": "e7f0...", "site_id": "site-001", "environment": "stage", "namespace": "du-stage", "component": "du-healthcheck", "pid": 123, "hostname": "runner-1"}
+```
 
 ## Health Report Structure (excerpt)
 

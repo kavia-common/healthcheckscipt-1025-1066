@@ -1,4 +1,9 @@
 from typing import Any, Dict, Optional
+import logging
+
+from .logging_utils import LogContext, new_trace_id, log_with
+from . import config as _config
+from ..main import run_cli  # type: ignore
 
 # PUBLIC_INTERFACE
 def run_healthcheck(site_id: Optional[str] = None, environment: Optional[str] = None) -> Dict[str, Any]:
@@ -16,13 +21,8 @@ def run_healthcheck(site_id: Optional[str] = None, environment: Optional[str] = 
     Returns:
         Dict[str, Any]: Structured health report dictionary.
     """
-    # Import here to avoid circular or heavy imports during module load in Airflow scheduler
-    from . import config as _config
-    from ..main import run_cli  # type: ignore
-
     overrides: Dict[str, Any] = {}
     cfg = _config.AppConfig()
-    # Load to pick up YAML + env for defaults (namespace/selectors) using provided environment
     cfg.load_from_files_and_env(env_override=environment)
 
     if environment:
@@ -32,4 +32,10 @@ def run_healthcheck(site_id: Optional[str] = None, environment: Optional[str] = 
         overrides["node_label_selector"] = cfg.node_label_selector
         overrides["pod_label_selector"] = cfg.pod_label_selector
 
-    return run_cli(site_id=site_id, environment=environment, overrides=overrides)  # type: ignore
+    trace = new_trace_id()
+    logger = logging.getLogger("du-healthcheck")
+    with LogContext(trace_id=trace, site_id=site_id or cfg.site_id, environment=environment or cfg.environment, namespace=cfg.namespace):
+        log_with(logger, logging.INFO, event="airflow_callable_start")
+        result = run_cli(site_id=site_id, environment=environment, overrides=overrides)  # type: ignore
+        log_with(logger, logging.INFO, event="airflow_callable_end", status=result.get("status"))
+        return result
