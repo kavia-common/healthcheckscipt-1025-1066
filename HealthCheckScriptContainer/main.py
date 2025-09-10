@@ -43,6 +43,41 @@ from app.utils import (
 from app.logging_utils import LogContext, log_with, new_trace_id
 
 
+def _apply_overrides(cfg: AppConfig, site_id: Optional[str], environment: Optional[str], overrides: Optional[Dict[str, Any]]) -> None:
+    """Apply site_id, environment, and field overrides to config."""
+    if environment:
+        cfg.environment = environment
+    if site_id is not None:
+        cfg.site_id = site_id
+    if overrides:
+        for k, v in overrides.items():
+            if hasattr(cfg, k) and v is not None:
+                setattr(cfg, k, v)
+
+
+def _build_connectivity(cfg: AppConfig) -> Dict[str, Any]:
+    """Build connectivity dict for CU and RU endpoints."""
+    return {
+        "cu": tcp_connectivity_check(cfg.cu_host, cfg.cu_port, cfg.connectivity_timeout),
+        "ru": tcp_connectivity_check(cfg.ru_host, cfg.ru_port, cfg.connectivity_timeout),
+    }
+
+
+def _report_to_dict(report) -> Dict[str, Any]:
+    """Convert HealthResult dataclass to dict compatible structure."""
+    return {
+        "site_id": report.site_id,
+        "environment": report.environment,
+        "timestamp": report.timestamp,
+        "nodes": report.nodes,
+        "pods": report.pods,
+        "connectivity": report.connectivity,
+        "metrics": report.metrics,
+        "status": report.status,
+        "summary": report.summary,
+    }
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="du-healthcheck",
@@ -74,19 +109,10 @@ def run_cli(site_id: Optional[str] = None, environment: Optional[str] = None, ov
     """
     cfg = AppConfig()
     cfg.load_from_files_and_env(env_override=environment)
-
-    if environment:
-        cfg.environment = environment
-    if site_id is not None:
-        cfg.site_id = site_id
-    if overrides:
-        for k, v in overrides.items():
-            if hasattr(cfg, k) and v is not None:
-                setattr(cfg, k, v)
+    _apply_overrides(cfg, site_id, environment, overrides)
 
     logger = setup_logging(cfg.log_level)
 
-    # Establish logging context for this run (use existing trace if present)
     trace = new_trace_id()
     with LogContext(trace_id=trace, site_id=cfg.site_id, environment=cfg.environment, namespace=cfg.namespace):
         log_with(logger, logging.INFO, event="run_start", message="Starting DU health check")
@@ -119,24 +145,11 @@ def run_cli(site_id: Optional[str] = None, environment: Optional[str] = None, ov
             metrics = collect_logs_and_metrics(core_api, cfg.namespace, pods)
             log_with(logger, logging.INFO, event="metrics_collected")
 
-            connectivity = {
-                "cu": tcp_connectivity_check(cfg.cu_host, cfg.cu_port, cfg.connectivity_timeout),
-                "ru": tcp_connectivity_check(cfg.ru_host, cfg.ru_port, cfg.connectivity_timeout),
-            }
+            connectivity = _build_connectivity(cfg)
             log_with(logger, logging.INFO, event="connectivity_complete", cu=connectivity.get("cu"), ru=connectivity.get("ru"))
 
             report = build_health_report(cfg.site_id, cfg.environment, nodes, pods, connectivity, metrics)
-            result_json = {
-                "site_id": report.site_id,
-                "environment": report.environment,
-                "timestamp": report.timestamp,
-                "nodes": report.nodes,
-                "pods": report.pods,
-                "connectivity": report.connectivity,
-                "metrics": report.metrics,
-                "status": report.status,
-                "summary": report.summary,
-            }
+            result_json = _report_to_dict(report)
 
             log_with(logger, logging.INFO, event="run_end", status=result_json.get("status"))
             return result_json
@@ -150,20 +163,11 @@ def main() -> int:
     args = _parse_args()
     env_arg = args.env if getattr(args, "env", None) else args.environment
 
-    overrides: Dict[str, Any] = {}
-    if args.namespace:
-        overrides["namespace"] = args.namespace
-    if args.node_label_selector:
-        overrides["node_label_selector"] = args.node_label_selector
-    if args.pod_label_selector:
-        overrides["pod_label_selector"] = args.pod_label_selector
-    if args.log_level:
-        overrides["log_level"] = args.log_level
+    overrides = _build_overrides_from_args(args)
 
     try:
         result = run_cli(site_id=args.site_id, environment=env_arg, overrides=overrides)
     except Exception as exc:
-        # Structured fatal error with a trace
         logger = setup_logging(overrides.get("log_level") or "INFO")
         log_with(logger, logging.ERROR, event="fatal_error", error=str(exc))
         print(f"[FATAL] DU health check failed: {exc}", file=sys.stderr)
@@ -179,49 +183,74 @@ def main() -> int:
     logger = setup_logging(cfg.log_level)
 
     if not args.no_kafka:
-        try:
-            log_with(logger, logging.INFO, event="publish_kafka_start", topic=cfg.kafka_health_topic)
-            send_to_kafka(cfg.kafka_bootstrap_servers, cfg.kafka_health_topic, result, logger)
-            log_with(logger, logging.INFO, event="publish_kafka_end")
-        except Exception as exc:
-            log_with(logger, logging.ERROR, event="publish_kafka_error", error=str(exc))
-            if not args.no_loki:
-                try:
-                    push_to_loki(
-                        cfg.loki_url,
-                        cfg.loki_tenant_id,
-                        cfg.loki_labels,
-                        [{"level": "error", "event": "kafka_publish_failed", "error": str(exc), "site_id": cfg.site_id}],
-                        logger,
-                    )
-                except Exception:
-                    pass
+        _publish_to_kafka_safe(cfg, result, logger, also_push_loki=not args.no_loki)
 
     if not args.no_loki:
-        loki_entries = []
-        metrics = result.get("metrics", {})
-        if isinstance(metrics, dict) and metrics.get("anomalies"):
-            for a in metrics["anomalies"]:
-                loki_entries.append({"level": "warn", "event": "anomaly", "details": a, "site_id": cfg.site_id})
-        loki_entries.append(
-            {
-                "level": "info",
-                "event": "du_health_summary",
-                "summary": result.get("summary"),
-                "status": result.get("status"),
-                "site_id": cfg.site_id,
-            }
-        )
+        loki_entries = _build_loki_entries(result, cfg.site_id)
         try:
             log_with(logger, logging.INFO, event="push_loki_start", entries=len(loki_entries))
             push_to_loki(cfg.loki_url, cfg.loki_tenant_id, cfg.loki_labels, loki_entries, logger)
             log_with(logger, logging.INFO, event="push_loki_end")
         except Exception:
-            # Already logged internally; no re-raise here
             pass
 
     print(json.dumps(result, indent=2))
     return 0 if result.get("status") == "healthy" else 1
+
+
+def _build_overrides_from_args(args: argparse.Namespace) -> Dict[str, Any]:
+    """Build overrides dict from CLI args."""
+    overrides: Dict[str, Any] = {}
+    if getattr(args, "namespace", None):
+        overrides["namespace"] = args.namespace
+    if getattr(args, "node_label_selector", None):
+        overrides["node_label_selector"] = args.node_label_selector
+    if getattr(args, "pod_label_selector", None):
+        overrides["pod_label_selector"] = args.pod_label_selector
+    if getattr(args, "log_level", None):
+        overrides["log_level"] = args.log_level
+    return overrides
+
+
+def _publish_to_kafka_safe(cfg: AppConfig, result: Dict[str, Any], logger: logging.Logger, also_push_loki: bool) -> None:
+    """Publish to Kafka and optionally emit a Loki error if publish fails."""
+    try:
+        log_with(logger, logging.INFO, event="publish_kafka_start", topic=cfg.kafka_health_topic)
+        send_to_kafka(cfg.kafka_bootstrap_servers, cfg.kafka_health_topic, result, logger)
+        log_with(logger, logging.INFO, event="publish_kafka_end")
+    except Exception as exc:
+        log_with(logger, logging.ERROR, event="publish_kafka_error", error=str(exc))
+        if also_push_loki:
+            try:
+                push_to_loki(
+                    cfg.loki_url,
+                    cfg.loki_tenant_id,
+                    cfg.loki_labels,
+                    [{"level": "error", "event": "kafka_publish_failed", "error": str(exc), "site_id": cfg.site_id}],
+                    logger,
+                )
+            except Exception:
+                # Swallow; already logged inside push_to_loki
+                pass
+
+
+def _build_loki_entries(result: Dict[str, Any], site_id: Optional[str]) -> Dict[str, Any]:
+    """Build a list of Loki entries from the result payload."""
+    entries = []
+    metrics = result.get("metrics", {})
+    if isinstance(metrics, dict) and metrics.get("anomalies"):
+        for a in metrics["anomalies"]:
+            entries.append({"level": "warn", "event": "anomaly", "details": a, "site_id": site_id})
+    entries.append(
+        {
+            "level": "info",
+            "event": "du_health_summary",
+            "summary": result.get("summary"),
+            "status": result.get("status"),
+            "site_id": site_id,
+        }
+    )
+    return entries
 
 
 if __name__ == "__main__":

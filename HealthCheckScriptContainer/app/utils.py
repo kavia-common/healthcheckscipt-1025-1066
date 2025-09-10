@@ -16,6 +16,62 @@ from confluent_kafka import Producer
 from .logging_utils import log_with, setup_logging as setup_structured_logging, trace_id_ctx
 
 
+def _vault_candidate_urls(vault_addr: str, secret_path: str) -> List[str]:
+    """Build candidate URLs for Vault KV v2 and direct path styles."""
+    urls = [f"{vault_addr}/v1/{secret_path}"]
+    if "/data/" not in secret_path:
+        parts = secret_path.split("/", 1)
+        if len(parts) == 2:
+            urls.append(f"{vault_addr}/v1/{parts[0]}/data/{parts[1]}")
+    return urls
+
+
+def _extract_kubeconfig_from_payload(payload: Dict[str, Any]) -> str:
+    """Extract kubeconfig from possible KV v2 payload shapes."""
+    if "data" in payload and isinstance(payload["data"], dict):
+        inner = payload["data"]
+        # KV v2: {data: {data: {...}}}
+        if "data" in inner and isinstance(inner["data"], dict):
+            return inner["data"].get("kubeconfig", "") or ""
+        # KV v1 or direct: {data: {...}}
+        return inner.get("kubeconfig", "") or ""
+    return ""
+
+
+def _log_vault_start(logger: logging.Logger, url: str, timeout: float) -> None:
+    """Log vault request start with context."""
+    log_with(
+        logger,
+        logging.INFO,
+        event="vault_request_start",
+        trace_id=trace_id_ctx.get(),
+        url=url,
+        timeout=timeout,
+    )
+
+
+def _log_vault_end(logger: logging.Logger, status_code: int) -> None:
+    """Log vault request end."""
+    log_with(
+        logger,
+        logging.INFO,
+        event="vault_request_end",
+        status_code=status_code,
+        ok=status_code < 400,
+    )
+
+
+def _log_vault_error(logger: logging.Logger, url: str, exc: Exception) -> None:
+    """Log vault request error."""
+    log_with(
+        logger,
+        logging.ERROR,
+        event="vault_request_error",
+        error=str(exc),
+        url=url,
+    )
+
+
 # PUBLIC_INTERFACE
 def setup_logging(level: str = "INFO") -> logging.Logger:
     """Initialize and return a configured logger (structured JSON)."""
@@ -26,60 +82,25 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
 def fetch_kubeconfig_from_vault(vault_addr: str, token: str, secret_path: str, timeout: float = 8.0) -> str:
     """Fetch kubeconfig content from HashiCorp Vault KV v2 and return as a string."""
     logger = logging.getLogger("du-healthcheck")
-    # Detect if path is kv-v2 and build URL format: /v1/<mount>/data/<path>
     headers = {"X-Vault-Token": token}
     session = requests.Session()
     session.headers.update(headers)
-    urls = [
-        f"{vault_addr}/v1/{secret_path}",
-    ]
-    if "/data/" not in secret_path:
-        parts = secret_path.split("/", 1)
-        if len(parts) == 2:
-            urls.append(f"{vault_addr}/v1/{parts[0]}/data/{parts[1]}")
+    urls = _vault_candidate_urls(vault_addr, secret_path)
 
     last_error: Optional[Exception] = None
     for url in urls:
         try:
-            log_with(
-                logger,
-                logging.INFO,
-                event="vault_request_start",
-                trace_id=trace_id_ctx.get(),
-                url=url,
-                timeout=timeout,
-            )
+            _log_vault_start(logger, url, timeout)
             resp = session.get(url, timeout=timeout)
-            status = resp.status_code
-            log_with(
-                logger,
-                logging.INFO,
-                event="vault_request_end",
-                status_code=status,
-                ok=status < 400,
-            )
+            _log_vault_end(logger, resp.status_code)
             resp.raise_for_status()
-            payload = resp.json()
-            if "data" in payload and isinstance(payload["data"], dict) and "data" in payload["data"]:
-                kube = payload["data"]["data"].get("kubeconfig", "")
-                if not kube:
-                    raise RuntimeError("kubeconfig_empty")
-                return kube
-            if "data" in payload and isinstance(payload["data"], dict):
-                kube = payload["data"].get("kubeconfig", "")
-                if not kube:
-                    raise RuntimeError("kubeconfig_empty")
-                return kube
-            raise RuntimeError("unexpected_vault_payload")
+            kube = _extract_kubeconfig_from_payload(resp.json())
+            if not kube:
+                raise RuntimeError("kubeconfig_empty")
+            return kube
         except Exception as exc:
             last_error = exc
-            log_with(
-                logger,
-                logging.ERROR,
-                event="vault_request_error",
-                error=str(exc),
-                url=url,
-            )
+            _log_vault_error(logger, url, exc)
             continue
     raise RuntimeError(f"Failed to retrieve kubeconfig from Vault: {last_error}")
 
@@ -355,6 +376,93 @@ def _parse_sctp_ss(output: str) -> Dict[str, Any]:
     return {"has_sctp": has_sctp, "lines": lines}
 
 
+def _container_names_from_pod(pod: Dict[str, Any]) -> List[str]:
+    """Extract container names from a pod dict."""
+    names: List[str] = []
+    for c in pod.get("containers", []):
+        if isinstance(c, dict) and "name" in c:
+            names.append(c["name"])
+    return names
+
+
+def _collect_single_container_metrics(
+    core_api: client.CoreV1Api, namespace: str, pod_name: str, cname: str
+) -> Dict[str, Any]:
+    """Collect CPU, memory, disk, and SCTP metrics for a single container."""
+    cont_res: Dict[str, Any] = {"cpu": None, "memory": None, "disks": None, "sctp": None, "errors": []}
+    _collect_cpu_metric(core_api, namespace, pod_name, cname, cont_res)
+    _collect_memory_metric(core_api, namespace, pod_name, cname, cont_res)
+    _collect_disk_metric(core_api, namespace, pod_name, cname, cont_res)
+    _collect_sctp_metric(core_api, namespace, pod_name, cname, cont_res)
+    return cont_res
+
+
+def _collect_cpu_metric(core_api: client.CoreV1Api, namespace: str, pod_name: str, cname: str, cont_res: Dict[str, Any]) -> None:
+    """Populate CPU metric for container."""
+    code, out, err = _safe_exec_command(core_api, namespace, pod_name, cname, ["top -b -n1 | head -n 5"])
+    if code == 0 and out:
+        cont_res["cpu"] = {"util_percent": _parse_cpu_from_top(out), "raw": out.splitlines()[:6]}
+    else:
+        cont_res["errors"].append({"component": "cpu", "error": err})
+
+
+def _collect_memory_metric(core_api: client.CoreV1Api, namespace: str, pod_name: str, cname: str, cont_res: Dict[str, Any]) -> None:
+    """Populate memory metric for container."""
+    code, out, err = _safe_exec_command(core_api, namespace, pod_name, cname, ["free -m || cat /proc/meminfo | head -n 20"])
+    if code != 0 or not out:
+        cont_res["errors"].append({"component": "memory", "error": err})
+        return
+    if "Mem:" in out:
+        cont_res["memory"] = _parse_mem_from_free(out)
+        return
+    try:
+        kv = {}
+        for ln in out.splitlines():
+            if ":" in ln:
+                k, v = ln.split(":", 1)
+                kv[k.strip()] = v.strip()
+        def _num_from(s: str) -> Optional[float]:
+            m = re.search(r"([0-9]+)", s or "")
+            return float(m.group(1)) if m else None
+        total_kb = _num_from(kv.get("MemTotal", "")) or 0.0
+        free_kb = _num_from(kv.get("MemFree", "")) or 0.0
+        buffers_kb = _num_from(kv.get("Buffers", "")) or 0.0
+        cached_kb = _num_from(kv.get("Cached", "")) or 0.0
+        available_kb = _num_from(kv.get("MemAvailable", "")) or (free_kb + buffers_kb + cached_kb)
+        used_kb = max(0.0, total_kb - available_kb)
+        cont_res["memory"] = {
+            "total_mb": round(total_kb / 1024.0, 2),
+            "used_mb": round(used_kb / 1024.0, 2),
+            "free_mb": round(available_kb / 1024.0, 2),
+            "used_percent": (round(used_kb / 1024.0, 2) / round(total_kb / 1024.0, 2)) * 100.0 if total_kb > 0 else None,
+        }
+    except Exception as ex:
+        cont_res["errors"].append({"component": "memory", "error": str(ex)})
+
+
+def _collect_disk_metric(core_api: client.CoreV1Api, namespace: str, pod_name: str, cname: str, cont_res: Dict[str, Any]) -> None:
+    """Populate disk metric for container."""
+    code, out, err = _safe_exec_command(core_api, namespace, pod_name, cname, ["df -h"])
+    if code == 0 and out:
+        cont_res["disks"] = _parse_df_h(out)
+    else:
+        cont_res["errors"].append({"component": "disk", "error": err})
+
+
+def _collect_sctp_metric(core_api: client.CoreV1Api, namespace: str, pod_name: str, cname: str, cont_res: Dict[str, Any]) -> None:
+    """Populate SCTP metric for container."""
+    code, out, err = _safe_exec_command(core_api, namespace, pod_name, cname, ["ss -H -t -a -p | grep -i sctp || true"])
+    if code != 0:
+        cont_res["errors"].append({"component": "sctp", "error": err})
+        return
+    sctp = _parse_sctp_ss(out or "")
+    if not sctp["has_sctp"]:
+        code2, out2, _ = _safe_exec_command(core_api, namespace, pod_name, cname, ["grep -i sctp /proc/net/protocols || true"])
+        if code2 == 0 and out2:
+            sctp = {"has_sctp": True, "lines": out2.splitlines()}
+    cont_res["sctp"] = sctp
+
+
 def _collect_container_system_metrics(core_api: client.CoreV1Api, namespace: str, pod: Dict[str, Any]) -> Dict[str, Any]:
     """
     For each applicable container in the given pod, exec into the container and collect:
@@ -367,153 +475,72 @@ def _collect_container_system_metrics(core_api: client.CoreV1Api, namespace: str
         Dict[str, Any]: keyed by container name with metrics and raw outputs for traceability.
     """
     pod_name = pod.get("name")
-    containers = []
-    for c in pod.get("containers", []):
-        if isinstance(c, dict) and "name" in c:
-            containers.append(c["name"])
+    containers = _container_names_from_pod(pod)
     results: Dict[str, Any] = {}
-
     for cname in containers:
-        cont_res: Dict[str, Any] = {"cpu": None, "memory": None, "disks": None, "sctp": None, "errors": []}
-        # CPU utilization
-        # Command: Use 'top -b -n1' to retrieve CPU summary; parse %id to compute utilization.
-        code, out, err = _safe_exec_command(core_api, namespace, pod_name, cname, ["top -b -n1 | head -n 5"])
-        if code == 0 and out:
-            cont_res["cpu"] = {"util_percent": _parse_cpu_from_top(out), "raw": out.splitlines()[:6]}
-        else:
-            cont_res["errors"].append({"component": "cpu", "error": err})
-
-        # Memory usage
-        # Command: 'free -m' for totals; fallback to /proc/meminfo if free is missing.
-        code, out, err = _safe_exec_command(core_api, namespace, pod_name, cname, ["free -m || cat /proc/meminfo | head -n 20"])
-        if code == 0 and out:
-            if "Mem:" in out:
-                cont_res["memory"] = _parse_mem_from_free(out)
-            else:
-                # rudimentary parse from meminfo (in kB)
-                try:
-                    kv = {}
-                    for ln in out.splitlines():
-                        if ":" in ln:
-                            k, v = ln.split(":", 1)
-                            kv[k.strip()] = v.strip()
-                    def _num_from(s: str) -> Optional[float]:
-                        m = re.search(r"([0-9]+)", s or "")
-                        return float(m.group(1)) if m else None
-                    total_kb = _num_from(kv.get("MemTotal", "")) or 0.0
-                    free_kb = _num_from(kv.get("MemFree", "")) or 0.0
-                    buffers_kb = _num_from(kv.get("Buffers", "")) or 0.0
-                    cached_kb = _num_from(kv.get("Cached", "")) or 0.0
-                    available_kb = _num_from(kv.get("MemAvailable", "")) or (free_kb + buffers_kb + cached_kb)
-                    used_kb = max(0.0, total_kb - available_kb)
-                    cont_res["memory"] = {
-                        "total_mb": round(total_kb / 1024.0, 2),
-                        "used_mb": round(used_kb / 1024.0, 2),
-                        "free_mb": round(available_kb / 1024.0, 2),
-                        "used_percent": (round(used_kb / 1024.0, 2) / round(total_kb / 1024.0, 2)) * 100.0
-                        if total_kb > 0
-                        else None,
-                    }
-                except Exception as ex:
-                    cont_res["errors"].append({"component": "memory", "error": str(ex)})
-        else:
-            cont_res["errors"].append({"component": "memory", "error": err})
-
-        # Disk utilization
-        # Command: 'df -h' to get filesystem usage inside container filesystem namespace.
-        code, out, err = _safe_exec_command(core_api, namespace, pod_name, cname, ["df -h"])
-        if code == 0 and out:
-            cont_res["disks"] = _parse_df_h(out)
-        else:
-            cont_res["errors"].append({"component": "disk", "error": err})
-
-        # SCTP status
-        # Command: 'ss -H -t -a -p | grep -i sctp' to check SCTP sockets (if ss present).
-        # Fallback: 'cat /proc/net/sctp/*' may exist on kernels with SCTP support.
-        code, out, err = _safe_exec_command(core_api, namespace, pod_name, cname, ["ss -H -t -a -p | grep -i sctp || true"])
-        if code == 0:
-            sctp = _parse_sctp_ss(out or "")
-            # If empty and ss missing, attempt /proc approach
-            if not sctp["has_sctp"]:
-                code2, out2, err2 = _safe_exec_command(core_api, namespace, pod_name, cname, ["grep -i sctp /proc/net/protocols || true"])
-                if code2 == 0 and out2:
-                    sctp = {"has_sctp": True, "lines": out2.splitlines()}
-            cont_res["sctp"] = sctp
-        else:
-            cont_res["errors"].append({"component": "sctp", "error": err})
-
-        results[cname] = cont_res
-
+        results[cname] = _collect_single_container_metrics(core_api, namespace, pod_name, cname)
     return results
 
 
 def collect_logs_and_metrics(core_api: client.CoreV1Api, namespace: str, pods: List[Dict[str, Any]], max_bytes: int = 50000) -> Dict[str, Any]:
-    """Fetch recent logs for DU pods and parse metrics, plus per-container system metrics via exec.
-
-    For each applicable container:
-      - Run 'top -b -n1' to estimate CPU utilization (parsed as 100 - idle)
-      - Run 'free -m' (or parse /proc/meminfo) for memory usage
-      - Run 'df -h' to capture disk usage per mountpoint
-      - Run 'ss -H -t -a -p | grep -i sctp' (fallback to /proc) to detect SCTP
-
-    Returns:
-      {
-        "pod_metrics": { "<pod>": { "radio": {...}, "containers": { "<container>": {...} } } },
-        "anomalies": [ ... ]
-      }
-    """
+    """Fetch recent logs for DU pods and parse metrics, plus per-container system metrics via exec."""
     aggregated: Dict[str, Any] = {"pod_metrics": {}, "anomalies": []}
     for p in pods:
-        name = p.get("name")
-        try:
-            log_text = core_api.read_namespaced_pod_log(
-                name=name,
-                namespace=namespace,
-                tail_lines=500,
-                timestamps=True,
-                _preload_content=True,
-            )
-            if len(log_text) > max_bytes:
-                log_text = log_text[-max_bytes:]
-            radio_metrics = _parse_metrics_from_text(log_text)
-
-            # Exec into containers to fetch system metrics
-            container_metrics = _collect_container_system_metrics(core_api, namespace, p)
-
-            aggregated["pod_metrics"][name] = {
-                "radio": radio_metrics,
-                "containers": container_metrics,
-            }
-
-            # simple anomaly heuristics based on radio metrics and container resource red flags
-            if radio_metrics.get("srs_errors", 0) > 0 or radio_metrics.get("phy_ul_crc_fail", 0) > 0:
-                aggregated["anomalies"].append(
-                    {
-                        "pod": name,
-                        "reason": "radio_metric_anomaly",
-                        "metrics": radio_metrics,
-                    }
-                )
-
-            # Add anomalies if any container shows very high CPU or memory use
-            for cname, cm in container_metrics.items():
-                cpu_util = (cm.get("cpu") or {}).get("util_percent")
-                mem_used_pct = (cm.get("memory") or {}).get("used_percent")
-                if (cpu_util is not None and cpu_util > 90.0) or (mem_used_pct is not None and mem_used_pct > 90.0):
-                    aggregated["anomalies"].append(
-                        {
-                            "pod": name,
-                            "container": cname,
-                            "reason": "resource_pressure",
-                            "cpu_util_percent": cpu_util,
-                            "mem_used_percent": mem_used_pct,
-                        }
-                    )
-
-        except ApiException as exc:
-            aggregated["pod_metrics"][name] = {"error": str(exc)}
-            aggregated["anomalies"].append({"pod": name, "reason": "log_or_exec_error", "error": str(exc)})
+        _process_pod_metrics(core_api, namespace, p, max_bytes, aggregated)
     return aggregated
+
+
+def _process_pod_metrics(
+    core_api: client.CoreV1Api,
+    namespace: str,
+    pod: Dict[str, Any],
+    max_bytes: int,
+    aggregated: Dict[str, Any],
+) -> None:
+    """Process logs and container metrics for a single pod and update aggregated dict."""
+    name = pod.get("name")
+    try:
+        log_text = core_api.read_namespaced_pod_log(
+            name=name,
+            namespace=namespace,
+            tail_lines=500,
+            timestamps=True,
+            _preload_content=True,
+        )
+        if len(log_text) > max_bytes:
+            log_text = log_text[-max_bytes:]
+        radio_metrics = _parse_metrics_from_text(log_text)
+        container_metrics = _collect_container_system_metrics(core_api, namespace, pod)
+
+        aggregated["pod_metrics"][name] = {"radio": radio_metrics, "containers": container_metrics}
+        _append_radio_anomalies(name, radio_metrics, aggregated)
+        _append_resource_anomalies(name, container_metrics, aggregated)
+    except ApiException as exc:
+        aggregated["pod_metrics"][name] = {"error": str(exc)}
+        aggregated["anomalies"].append({"pod": name, "reason": "log_or_exec_error", "error": str(exc)})
+
+
+def _append_radio_anomalies(pod_name: str, radio_metrics: Dict[str, Any], aggregated: Dict[str, Any]) -> None:
+    """Append radio metric anomalies to aggregated anomalies list if any."""
+    if radio_metrics.get("srs_errors", 0) > 0 or radio_metrics.get("phy_ul_crc_fail", 0) > 0:
+        aggregated["anomalies"].append({"pod": pod_name, "reason": "radio_metric_anomaly", "metrics": radio_metrics})
+
+
+def _append_resource_anomalies(pod_name: str, container_metrics: Dict[str, Any], aggregated: Dict[str, Any]) -> None:
+    """Append resource pressure anomalies based on CPU/memory thresholds."""
+    for cname, cm in container_metrics.items():
+        cpu_util = (cm.get("cpu") or {}).get("util_percent")
+        mem_used_pct = (cm.get("memory") or {}).get("used_percent")
+        if (cpu_util is not None and cpu_util > 90.0) or (mem_used_pct is not None and mem_used_pct > 90.0):
+            aggregated["anomalies"].append(
+                {
+                    "pod": pod_name,
+                    "container": cname,
+                    "reason": "resource_pressure",
+                    "cpu_util_percent": cpu_util,
+                    "mem_used_percent": mem_used_pct,
+                }
+            )
 
 
 # PUBLIC_INTERFACE
@@ -554,11 +581,10 @@ def build_health_report(
 ) -> HealthResult:
     """Assemble a structured health report."""
     timestamp = time.time()
-    node_ready = all([n.get("ready", False) for n in nodes if "ready" in n]) if nodes else False
-    pod_states = [p.get("phase", "") for p in pods if "phase" in p]
-    pods_running = all([ph.upper() == "RUNNING" for ph in pod_states]) if pod_states else False
+    node_ready = _all_nodes_ready(nodes)
+    pods_running = _all_pods_running(pods)
     anomalies = metrics.get("anomalies", [])
-    status = "healthy" if node_ready and pods_running and not anomalies and connectivity.get("cu", {}).get("reachable") and connectivity.get("ru", {}).get("reachable") else "degraded"
+    status = _derive_status(node_ready, pods_running, anomalies, connectivity)
 
     summary = {
         "node_ready_all": node_ready,
@@ -578,6 +604,30 @@ def build_health_report(
         status=status,
         summary=summary,
     )
+
+
+def _all_nodes_ready(nodes: List[Dict[str, Any]]) -> bool:
+    """Return True if all nodes are ready, False otherwise."""
+    if not nodes:
+        return False
+    return all(n.get("ready", False) for n in nodes if "ready" in n)
+
+
+def _all_pods_running(pods: List[Dict[str, Any]]) -> bool:
+    """Return True if all pods are in RUNNING phase."""
+    pod_states = [p.get("phase", "") for p in pods if "phase" in p]
+    if not pod_states:
+        return False
+    return all(ph.upper() == "RUNNING" for ph in pod_states)
+
+
+def _derive_status(node_ready: bool, pods_running: bool, anomalies: List[Dict[str, Any]], connectivity: Dict[str, Any]) -> str:
+    """Compute overall health status based on conditions."""
+    cu_ok = connectivity.get("cu", {}).get("reachable")
+    ru_ok = connectivity.get("ru", {}).get("reachable")
+    if node_ready and pods_running and not anomalies and cu_ok and ru_ok:
+        return "healthy"
+    return "degraded"
 
 
 # PUBLIC_INTERFACE
